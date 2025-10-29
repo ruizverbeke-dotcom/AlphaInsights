@@ -1,0 +1,34 @@
+# ===============================
+# Python & Virtual Environment
+# ===============================
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===============================
+# IDE & System Files
+# ===============================
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# ===============================
+# Data and Reports (Generated)
+# ===============================
+data/cache/
+data/processed/
+reports/
+*.xlsx
+*.pdf
+*.png
+*.csv
+
+# ===============================
+# Streamlit & Logs
+# ===============================
+.streamlit/
+logs/
