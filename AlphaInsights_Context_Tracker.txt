@@ -1,0 +1,22 @@
+📘 AlphaInsights Context Tracker
+--------------------------------
+Purpose: This file keeps the project’s running memory so progress can be transferred between chats.
+
+-------------------
+CURRENT STATUS LOG
+-------------------
+Date: 2025-10-29
+
+- Completed and committed both `comparison_dashboard.py` and `sharpe_dashboard.py`.
+- Implemented final stable Sharpe Ratio dashboard (error-free version with correct 1D handling).
+- Fixed critical Plotly “Data must be 1-dimensional” bug via np.ravel() normalization.
+- Benchmarked functionality tested: rolling Sharpe, cumulative growth, histograms all stable.
+- All dashboards fully functional in Streamlit and verified locally.
+- On branch: analytics-module.
+
+-------------------
+NOTES
+-------------------
+- Keep `AlphaInsights_Context_Tracker.txt` versioned to preserve project memory.
+- Next: refine visual styling (fonts, metrics cards), then integrate dashboard navigation links.
+- All commits tagged with `feat(ui): add stable Sharpe Ratio dashboard and update comparison dashboard`.
