@@ -32,3 +32,20 @@ reports/
 # ===============================
 .streamlit/
 logs/
+# ===============================
+# --- AlphaInsights documentation & branding cleanup ---
+# Ignore temporary / backup / autosave files
+docs/~$*.docx
+docs/*.tmp
+docs/*.bak
+docs/*backup*
+docs/*.pdf~
+docs/*.docx~
+docs/*.pptx~
+docs/*.rtf~
+docs/*.old
+docs/*.DS_Store
+
+# Ignore Canva and temporary exports (non-final)
+docs/exports/
+docs/drafts/
