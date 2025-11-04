@@ -18,6 +18,14 @@
       "docs: add innovation sparks log for emergent ideas and prototypes",
       "docs: add 2025-11-04 grand technical memo summarizing memory system initialization"
     ],
+    "pending_tasks": [
+      "Implement CVaR optimizer (optimization.py, optimizer_dashboard.py, test_analytics.py)"
+    ],
+    "next_planned_research": [
+      "Integrate ML Risk Forecaster (RandomForest)",
+      "Document AI Agent Spec",
+      "Add Innovation Sparks log automation"
+    ],
     "status": "Phase 3 complete — memory infrastructure operational",
     "integrity_checks": {
       "rules": [
