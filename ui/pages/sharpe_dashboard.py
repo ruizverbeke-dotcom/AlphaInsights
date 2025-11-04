@@ -524,6 +524,5 @@ if run_analysis:
 
     except Exception as e:
         st.error(f"❌ Unexpected error: {e}")
-
 else:
     st.info("👈 Configure your settings and click **Run Analysis** to begin.")
