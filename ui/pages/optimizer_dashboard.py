@@ -25,27 +25,47 @@ import plotly.express as px
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from analytics.optimization import optimize_cvar
-from ui.components.data_resolver import resolve_tickers  # ← intelligent name resolver
+from ui.components.data_resolver import resolve_tickers  # intelligent name resolver
 
 # --------------------------------------------------------------------------- #
 # Utility
 # --------------------------------------------------------------------------- #
 def _load_price_data(tickers: list[str], start: str, end: str) -> pd.DataFrame:
     """
-    Download adjusted close data using yfinance.
+    Download adjusted close data using yfinance, with intelligent NaN filtering.
 
-    The function assumes that tickers are already validated/resolved.
+    Behavior:
+    - Ensures DataFrame shape even for single tickers.
+    - Drops tickers that return all NaNs (unavailable feeds).
+    - Drops rows with partial NaNs (mixed calendars/holidays) to align series.
+    - Raises a clear error only if nothing usable remains.
     """
-    data = yf.download(tickers, start=start, end=end, progress=False, auto_adjust=True)["Close"]
-    data = data.squeeze("columns") if isinstance(data, pd.DataFrame) else data
-    df = pd.DataFrame(data).dropna(how="any")
-    if df.empty:
-        raise ValueError("No valid price data found for provided tickers.")
-    return df
+    data = yf.download(
+        tickers, start=start, end=end, progress=False, auto_adjust=True
+    )["Close"]
+
+    # Ensure DataFrame
+    if isinstance(data, pd.Series):
+        data = data.to_frame()
+
+    # Identify and drop tickers with all NaNs
+    all_nan_cols = [c for c in data.columns if data[c].isna().all()]
+    if all_nan_cols:
+        st.warning(f"Dropping tickers with no valid data: {', '.join(map(str, all_nan_cols))}")
+        data = data.drop(columns=all_nan_cols)
+
+    # Drop rows with partial NaNs (different trading calendars)
+    data = data.dropna(how="any")
+
+    if data.empty:
+        raise ValueError("No valid price data remaining after cleanup.")
+    return data
 
 
 def _compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """Compute log returns from price data."""
+    """
+    Compute log returns from price data with strict 1-D safety before math.
+    """
     prices = prices.squeeze("columns") if isinstance(prices, pd.DataFrame) else prices
     returns = np.log(prices / prices.shift(1)).dropna()
     returns = returns.squeeze("columns") if isinstance(returns, pd.DataFrame) else returns
@@ -105,9 +125,9 @@ if run_button:
         st.error("No valid tickers could be resolved from your input.")
         st.stop()
 
-    st.success(f"Resolved tickers: {', '.join(tickers)}")
+    st.success(f"Resolved tickers: {', '.join(map(str, tickers))}")
 
-    # --- Step 2: Fetch data ---
+    # --- Step 2: Fetch data (resilient to missing calendars/feeds) ---
     with st.spinner("Fetching price data..."):
         try:
             prices = _load_price_data(tickers, str(start_date), str(end_date))
@@ -115,7 +135,7 @@ if run_button:
             st.error(f"Data fetch failed: {e}")
             st.stop()
 
-    # --- Step 3: Compute returns ---
+    # --- Step 3: Compute returns (1-D safe) ---
     returns = _compute_returns(prices)
 
     # --- Step 4: Prepare constraints ---
@@ -148,7 +168,7 @@ if run_button:
     col3.metric("Annualized Volatility", f"{result['ann_vol']:.4f}")
     col4.metric("Solver", result["solver"])
 
-    # --- Plot Weights ---
+    # --- Plot Weights (1-D safe bar chart) ---
     weights_reset = weights.reset_index().rename(columns={"index": "Asset"})
     weights_reset["Weight"] = weights_reset["Weight"].astype(float).clip(lower=0)
     fig = px.bar(
