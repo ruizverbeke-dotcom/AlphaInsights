@@ -44,7 +44,6 @@ def _load_price_data(tickers: list[str], start: str, end: str) -> pd.DataFrame:
         tickers, start=start, end=end, progress=False, auto_adjust=True
     )["Close"]
 
-    # Ensure DataFrame
     if isinstance(data, pd.Series):
         data = data.to_frame()
 
@@ -70,6 +69,7 @@ def _compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
     returns = np.log(prices / prices.shift(1)).dropna()
     returns = returns.squeeze("columns") if isinstance(returns, pd.DataFrame) else returns
     return pd.DataFrame(returns)
+
 
 # --------------------------------------------------------------------------- #
 # Streamlit UI
@@ -104,28 +104,34 @@ max_weight = st.sidebar.number_input("Global Max Weight", 0.0, 1.0, 1.0, 0.05)
 excl_text = st.sidebar.text_input("Exclude Tickers", placeholder="e.g. TSLA, NVDA")
 run_button = st.sidebar.button("🚀 Run Optimization", type="primary")
 
+
 # --------------------------------------------------------------------------- #
 # Main Execution
 # --------------------------------------------------------------------------- #
 if run_button:
-    # --- Step 1: Parse and intelligently resolve tickers ---
-    raw_inputs = [t.strip() for t in tickers_input.split(",") if t.strip()]
-    if not raw_inputs:
+    # --- Step 1: Intelligently resolve tickers ---
+    if not tickers_input.strip():
         st.error("Please enter at least one ticker.")
         st.stop()
 
     with st.spinner("Resolving tickers..."):
         try:
-            tickers = resolve_tickers(raw_inputs)
+            resolved, dropped = resolve_tickers(
+                tickers_input, start=str(start_date), end=str(end_date)
+            )
         except Exception as e:
             st.error(f"Ticker resolution failed: {e}")
             st.stop()
 
-    if not tickers:
-        st.error("No valid tickers could be resolved from your input.")
+    if not resolved:
+        st.error("No valid tickers could be resolved. Please adjust inputs.")
         st.stop()
 
-    st.success(f"Resolved tickers: {', '.join(map(str, tickers))}")
+    st.success(f"Resolved tickers: {', '.join(resolved)}")
+    if dropped:
+        st.warning(f"Dropping tickers with no valid data: {', '.join(dropped)}")
+
+    tickers = resolved
 
     # --- Step 2: Fetch data (resilient to missing calendars/feeds) ---
     with st.spinner("Fetching price data..."):
@@ -135,7 +141,7 @@ if run_button:
             st.error(f"Data fetch failed: {e}")
             st.stop()
 
-    # --- Step 3: Compute returns (1-D safe) ---
+    # --- Step 3: Compute returns ---
     returns = _compute_returns(prices)
 
     # --- Step 4: Prepare constraints ---
@@ -161,14 +167,14 @@ if run_button:
 
     st.dataframe(weights.style.format("{:.4f}"))
 
-    # Display key metrics
+    # Display metrics
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Expected Shortfall (ES)", f"{result['es']:.4f}")
     col2.metric("Value-at-Risk (VaR)", f"{result['var']:.4f}")
     col3.metric("Annualized Volatility", f"{result['ann_vol']:.4f}")
     col4.metric("Solver", result["solver"])
 
-    # --- Plot Weights (1-D safe bar chart) ---
+    # --- Plot Weights ---
     weights_reset = weights.reset_index().rename(columns={"index": "Asset"})
     weights_reset["Weight"] = weights_reset["Weight"].astype(float).clip(lower=0)
     fig = px.bar(
