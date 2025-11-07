@@ -11,6 +11,7 @@ Responsibilities:
 - Parse and resolve user inputs (tickers, names like 'Microsoft', 'CAC 40', 'Gold').
 - Call the backend /optimize/cvar endpoint with canonical tickers & parameters.
 - Display returned weights and risk metrics (ES, VaR, annualized vol).
+- Provide real-time backend health diagnostics in the sidebar.
 
 All heavy lifting (data fetch, returns, optimization) happens in the backend.
 """
@@ -18,6 +19,7 @@ All heavy lifting (data fetch, returns, optimization) happens in the backend.
 import sys
 import os
 from typing import List
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -76,19 +78,28 @@ def _call_cvar_api(
         raise RuntimeError(f"Failed to reach backend API at {BACKEND_URL}: {exc}") from exc
 
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Backend error {resp.status_code}: {resp.text}"
-        )
+        raise RuntimeError(f"Backend error {resp.status_code}: {resp.text}")
 
     data = resp.json()
-    # Minimal schema validation
     required_keys = {"weights", "es", "var", "ann_vol", "solver", "success", "summary"}
     if not required_keys.issubset(data.keys()):
-        raise RuntimeError(
-            f"Backend response missing keys. Got: {sorted(data.keys())}"
-        )
+        raise RuntimeError(f"Backend response missing keys. Got: {sorted(data.keys())}")
 
     return data
+
+
+def _ping_backend_health() -> dict:
+    """
+    Query the backend /health endpoint to verify system status.
+    Returns a parsed dictionary or raises a RuntimeError on failure.
+    """
+    try:
+        resp = requests.get(f"{BACKEND_URL}/health", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+        raise RuntimeError(f"Unexpected status {resp.status_code}")
+    except Exception as e:
+        raise RuntimeError(f"Backend unreachable: {e}") from e
 
 
 # --------------------------------------------------------------------------- #
@@ -224,6 +235,22 @@ else:
         "This dashboard now calls the AlphaInsights Backend API, "
         "making it deployment-ready and agent-friendly."
     )
+
+# --------------------------------------------------------------------------- #
+# Backend Health Check (Phase 5.4)
+# --------------------------------------------------------------------------- #
+st.sidebar.markdown("---")
+st.sidebar.subheader("🩺 System Health")
+
+if st.sidebar.button("Check Backend Health"):
+    try:
+        health = _ping_backend_health()
+        st.sidebar.success(f"✅ Backend OK — {health.get('status', 'unknown').upper()}")
+        st.sidebar.write(f"**Phase:** {health.get('phase', 'N/A')}")
+        st.sidebar.write(f"**Time:** {health.get('timestamp', 'N/A')}")
+        st.sidebar.json(health)
+    except Exception as e:
+        st.sidebar.error(f"❌ {e}")
 
 # --------------------------------------------------------------------------- #
 # End of File
