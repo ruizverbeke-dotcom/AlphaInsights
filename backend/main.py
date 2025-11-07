@@ -3,15 +3,17 @@ AlphaInsights Backend API
 -------------------------
 FastAPI backend service exposing optimization and health endpoints.
 
-Phase 6.0–6.1 Summary
+Phase 6.0–6.2 Summary
 ---------------------
 - Provides CVaR and Sharpe optimization endpoints.
 - Uses a shared symbol resolver to normalize human-friendly inputs:
     e.g. "apple" -> "AAPL", "gold" -> "GC=F", "cac 40" -> "^FCHI".
 - Centralizes data loading with robust fallbacks:
     • Prefer 'Adj Close', fallback to 'Close'.
-    • Cleans and aligns data across assets (no empty returns matrices).
+    • Cleans and aligns data across assets.
+    • Drops illiquid / broken series with too little data.
 - Delegates Sharpe optimization core logic to analytics.optimization.optimize_sharpe.
+- Designed to be agent-ready: typed models, stable JSON schemas, deterministic math.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
 from core.health import system_health
 from core.symbol_resolver import resolve_tickers
-from analytics.optimization import optimize_sharpe  # Sharpe optimizer core (Phase 6.0)
+from analytics.optimization import optimize_sharpe  # Sharpe optimizer core (Phase 6.0+)
 
 # --------------------------------------------------------------------------- #
 # FastAPI App
@@ -44,7 +46,7 @@ from analytics.optimization import optimize_sharpe  # Sharpe optimizer core (Pha
 
 app = FastAPI(
     title="AlphaInsights Backend API",
-    version="1.1",
+    version="1.2",
     description=(
         "FastAPI synchronization layer for CVaR, Sharpe, and future analytics endpoints. "
         "Uses shared symbol resolution and robust data loading."
@@ -98,7 +100,7 @@ class SharpeResponse(BaseModel):
     """
     Response schema for Sharpe optimizer.
 
-    Matches the stable agent-ready contract from analytics.optimize_sharpe.
+    Mirrors analytics.optimize_sharpe stable contract.
     """
     weights: Dict[str, float]
     sharpe: float
@@ -117,13 +119,16 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
     Resolve tickers, download prices, and compute daily log returns.
 
-    Robust behavior (Phase 6.1.B)
-    -----------------------------
-    - Uses core.symbol_resolver.resolve_tickers for human inputs.
-    - Prefers 'Adj Close', falls back to 'Close'.
-    - Drops assets with too little data.
-    - Forward/backward fills small gaps to align calendars.
-    - Guarantees a non-empty 2-D returns matrix or raises a clean 400 error.
+    Robust behavior
+    ---------------
+    1. Uses core.symbol_resolver.resolve_tickers for human-friendly inputs.
+    2. Downloads data via yfinance with:
+         - threads=True for speed
+         - timeout=60s to reduce spurious timeouts
+    3. Prefers 'Adj Close', falls back to 'Close'.
+    4. Drops assets with insufficient observations (illiquid / broken).
+    5. Forward/ backward fills small gaps to align calendars.
+    6. Returns a non-empty 2-D returns matrix or raises a clean HTTP 400.
 
     Returns
     -------
@@ -138,7 +143,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     # 1) Resolve free-form labels to concrete symbols
     resolved, messages = resolve_tickers(tickers)
     for msg in messages:
-        # Logged to backend console for traceability
+        # Logged to backend console for traceability; UI can display its own hints.
         print(f"[resolver] {msg}")
 
     if not resolved:
@@ -155,6 +160,8 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             end=end,
             progress=False,
             auto_adjust=False,
+            threads=True,
+            timeout=60,  # increased to avoid unnecessary timeouts on multi-asset queries
         )
     except Exception as e:
         raise HTTPException(
@@ -168,7 +175,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             detail=f"No data returned for tickers: {resolved}",
         )
 
-    # 3) Extract price matrix (Adj Close preferred)
+    # 3) Extract price matrix (Adj Close preferred, fallback Close)
     if "Adj Close" in data:
         prices = data["Adj Close"]
     elif "Close" in data:
@@ -182,7 +189,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     if isinstance(prices, pd.Series):
         prices = prices.to_frame()
 
-    # Normalize column labels (in case of MultiIndex from yf)
+    # Normalize column labels if MultiIndex
     if isinstance(prices.columns, pd.MultiIndex):
         prices.columns = [str(c[-1]) for c in prices.columns]
 
@@ -194,7 +201,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             detail=f"No valid price data for tickers after initial cleanup: {resolved}",
         )
 
-    # 5) Keep only assets with sufficient observations (e.g. >= 30)
+    # 5) Keep only assets with sufficient observations (e.g. >= 30 points)
     valid_cols = [c for c in prices.columns if prices[c].notna().sum() >= 30]
     if not valid_cols:
         raise HTTPException(
@@ -203,7 +210,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
         )
     prices = prices[valid_cols]
 
-    # 6) Align calendars: fill internal gaps, keep overall structure
+    # 6) Align calendars: sort, forward-fill, back-fill
     prices = prices.sort_index()
     prices = prices.ffill().bfill()
 
@@ -215,7 +222,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             detail="Price alignment resulted in empty series.",
         )
 
-    # 7) Compute log returns, drop only rows where all returns are NaN
+    # 7) Compute log returns; drop rows where all returns are NaN
     returns = np.log(prices / prices.shift(1))
     returns = returns.replace([np.inf, -np.inf], np.nan)
     returns = returns.dropna(how="all", axis=0)
@@ -380,7 +387,7 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
 @app.post("/optimize/sharpe", response_model=SharpeResponse)
 async def optimize_sharpe_endpoint(request: OptimizeRequest):
     """
-    Sharpe optimizer endpoint (Phase 6.0 / 6.1).
+    Sharpe optimizer endpoint (Phase 6.0–6.2).
 
     - Resolves tickers via shared resolver.
     - Loads and cleans log returns.
@@ -394,9 +401,9 @@ async def optimize_sharpe_endpoint(request: OptimizeRequest):
 
         rf = float(request.rf) if request.rf is not None else 0.0
 
-        # analytics.optimize_sharpe is backend-compatible:
-        # it accepts risk_free_rate and `risk_free` via kwargs.
-        result = optimize_sharpe(returns, risk_free=rf)
+        # Call analytics.optimize_sharpe with explicit risk_free_rate keyword
+        # to avoid any ambiguity.
+        result = optimize_sharpe(returns, risk_free_rate=rf)
 
         return result
 
