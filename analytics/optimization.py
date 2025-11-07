@@ -1,35 +1,43 @@
-# analytics/optimization.py
 """
 AlphaInsights Optimization Module
 ---------------------------------
-Implements the CVaR (Expected Shortfall) optimizer using the
-Rockafellar–Uryasev formulation.
+Implements portfolio optimization utilities for AlphaInsights.
+
+Core components:
+- CVaR (Expected Shortfall) optimizer using Rockafellar–Uryasev formulation.
+- Sharpe Ratio optimizer (Phase 6.0) using SLSQP.
+- Minimum-variance baseline for comparisons.
 
 Design Principles
-- No network calls (pure math).
-- Typed, deterministic, 1-D safety enforced on inputs.
-- Agent-ready: clean I/O schema + human-readable summary string.
-- JSON-safe option for weights via constraints["as_dict"].
+-----------------
+- No network calls (pure math only).
+- Deterministic, testable, agent-ready.
+- Enforces 1-D safety on inputs to avoid (N, 1) vs (N,) bugs.
+- Returns JSON-serializable structures suitable for backend/API/agents.
 
-Returns schema (stable for agents / API)
-----------------------------------------
+Stable Output Schemas
+---------------------
+CVaR optimizer:
 {
   "weights": pd.Series | dict,   # dict if constraints["as_dict"] = True
-  "es": float,                   # Expected Shortfall on returns (negative tail)
-  "var": float,                  # VaR on returns (negative tail)
+  "es": float,                   # Expected Shortfall (on returns, negative tail)
+  "var": float,                  # VaR (on returns, negative tail)
   "ann_vol": float,              # Annualized volatility
-  "solver": str,                 # "ECOS" or "SCS" (when available)
-  "success": bool,               # True if solver status optimal/near-optimal
-  "summary": str,                # Human-readable one-liner for Explainability Agent
+  "solver": str,                 # e.g. "ECOS" or "SCS"
+  "success": bool,
+  "summary": str,                # Human-readable one-liner
 }
 
-How it integrates
------------------
-- Called by Optimizer Agent / UI (ui/pages/optimizer_dashboard.py) with a prepared
-  returns DataFrame (rows=time, cols=assets).
-- Upstream: Data Agent / UI loads prices (e.g., yfinance in UI), computes returns.
-- Downstream: Explainability Agent uses the "summary" and metrics to narrate results.
-- Automation: This function is deterministic and stateless → safe for schedulers.
+Sharpe optimizer (Phase 6.0):
+{
+  "weights": { "TICKER": float, ... },
+  "sharpe": float,               # Annualized Sharpe ratio
+  "ann_vol": float,              # Annualized volatility
+  "ann_return": float,           # Annualized expected return
+  "solver": "Sharpe_SLSQP",
+  "success": bool,
+  "summary": str,                # Human-readable one-liner
+}
 """
 
 from __future__ import annotations
@@ -39,6 +47,8 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+
+from scipy.optimize import minimize
 
 try:
     import cvxpy as cp
@@ -53,19 +63,23 @@ __all__ = [
     "optimize_cvar",
     "empirical_var_es",
     "sample_min_variance_weights",
+    "optimize_sharpe",
 ]
 
 
 # --------------------------------------------------------------------------- #
-# 1-D Safety Helper
+# 1-D / 2-D Safety Helpers
 # --------------------------------------------------------------------------- #
 def _ensure_2d_frame(returns: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure proper 2-D DataFrame with 1-D numeric columns.
+    Ensure a clean 2-D DataFrame with 1-D numeric columns.
 
     Enforces the global 1-D safety rule column-wise:
-      - squeeze("columns") for (N,1) shapes
-      - np.ravel to guarantee contiguous 1-D arrays
+    - squeeze("columns") for (N,1) shapes
+    - np.ravel(...) to guarantee contiguous 1-D arrays
+    - drop rows with any NaNs
+
+    This keeps downstream math and optimizers stable and predictable.
     """
     if not isinstance(returns, pd.DataFrame):
         raise TypeError("returns must be a pandas DataFrame with assets as columns.")
@@ -96,17 +110,19 @@ def empirical_var_es(loss: pd.Series, alpha: float) -> Tuple[float, float]:
     loss : pd.Series
         Loss series L_t. For portfolio returns r_t, define L_t = -r_t.
     alpha : float
-        Confidence level in (0, 1). Typical 0.90–0.99.
+        Confidence level in (0, 1). Typical range: 0.90–0.99.
 
     Returns
     -------
     (var_alpha, es_alpha) : Tuple[float, float]
-        VaR_alpha and ES_alpha computed empirically.
+        VaR_alpha and ES_alpha computed empirically on the loss distribution.
     """
     if not (0.80 <= alpha < 1.0):
         raise ValueError("alpha should be in [0.80, 1.0).")
+
     s = loss.squeeze("columns") if isinstance(loss, pd.DataFrame) else loss
     s = pd.Series(np.ravel(s), index=loss.index[: len(np.ravel(s))])
+
     var_alpha = float(np.quantile(s, alpha))
     tail = s[s >= var_alpha]
     es_alpha = float(tail.mean())
@@ -120,25 +136,30 @@ def _portfolio_stats(
     alpha: float = 0.95,
 ) -> Dict[str, float]:
     """
-    Compute per-period portfolio stats and tail metrics on returns.
+    Compute portfolio tail metrics and annualized volatility for given weights.
 
     Notes
     -----
-    - ES/VaR are reported on *returns* (negative values indicate left tail),
-      obtained by computing on losses and negating the sign.
+    - ES/VaR are reported on returns (negative values indicate left tail),
+      obtained by computing on losses and then negating the sign.
     """
     w = np.asarray(weights).reshape(-1, 1)
     port = np.ravel(returns.values @ w)
+
     vol = float(np.std(port, ddof=1)) if len(port) > 1 else 0.0
     ann_vol = float(np.sqrt(periods_per_year) * vol)
 
     loss = pd.Series(-port, index=returns.index[: len(port)])
     var_l, es_l = empirical_var_es(loss, alpha)
-    return {"var": -float(var_l), "es": -float(es_l), "ann_vol": ann_vol}
+    return {
+        "var": -float(var_l),
+        "es": -float(es_l),
+        "ann_vol": ann_vol,
+    }
 
 
 # --------------------------------------------------------------------------- #
-# Constraints
+# Constraints for CVaR Optimizer
 # --------------------------------------------------------------------------- #
 @dataclass
 class CVaRConstraints:
@@ -185,7 +206,7 @@ def optimize_cvar(
     returns : pd.DataFrame
         Asset returns (rows=time, cols=assets).
     alpha : float
-        Tail confidence level (0<alpha<1).
+        Tail confidence level (0 < alpha < 1).
     constraints : dict, optional
         {long_only, min_weight, max_weight, caps, excludes, budget, as_dict}
         - If "as_dict" is True, returns weights as a plain dict (JSON-safe).
@@ -269,7 +290,7 @@ def optimize_cvar(
             success = True
             break
 
-    # Fallback: equal weight across non-excluded assets
+    # Fallback: equal-weight across non-excluded assets
     def _fallback_result() -> Dict[str, Union[pd.Series, dict, float, str, bool]]:
         mask = np.ones(N, dtype=bool)
         for i in excl_idx:
@@ -278,13 +299,17 @@ def optimize_cvar(
         w_fb = np.zeros(N, dtype=float)
         if k:
             w_fb[mask] = c.budget / k
+
         stats = _portfolio_stats(R, w_fb, periods_per_year, alpha)
         summary = (
             f"CVaR optimization (α={alpha:.3f}) fell back to equal-weight; "
             f"ES={stats['es']:.4f}, VaR={stats['var']:.4f}, σₐ={stats['ann_vol']:.4f}."
         )
         weights_series = pd.Series(w_fb, index=names, name="weight")
-        weights_out: Union[pd.Series, dict] = weights_series.to_dict() if as_dict else weights_series
+        weights_out: Union[pd.Series, dict] = (
+            weights_series.to_dict() if as_dict else weights_series
+        )
+
         return {
             "weights": weights_out,
             "es": stats["es"],
@@ -300,6 +325,7 @@ def optimize_cvar(
 
     # Optimal solution
     w_opt = np.asarray(w.value).ravel()
+
     # Normalize to budget (numerical guard)
     s = w_opt.sum()
     if s:
@@ -311,7 +337,9 @@ def optimize_cvar(
         f"ES={stats['es']:.4f}, VaR={stats['var']:.4f}, σₐ={stats['ann_vol']:.4f}."
     )
     weights_series = pd.Series(w_opt, index=names, name="weight")
-    weights_out: Union[pd.Series, dict] = weights_series.to_dict() if as_dict else weights_series
+    weights_out: Union[pd.Series, dict] = (
+        weights_series.to_dict() if as_dict else weights_series
+    )
 
     return {
         "weights": weights_out,
@@ -325,22 +353,208 @@ def optimize_cvar(
 
 
 # --------------------------------------------------------------------------- #
-# Optional: simple min-variance baseline (used in comparison charts/tests)
+# Sharpe Ratio Optimizer (Phase 6.0)
+# --------------------------------------------------------------------------- #
+def optimize_sharpe(
+    returns: pd.DataFrame,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = 252,
+) -> Dict[str, Union[dict, float, str, bool]]:
+    """
+    Maximize the portfolio's annualized Sharpe Ratio using SLSQP.
+
+    Parameters
+    ----------
+    returns : pd.DataFrame
+        Asset returns (rows=time, cols=assets).
+    risk_free_rate : float
+        Annualized risk-free rate (e.g. 0.02 for 2%). Assumed constant.
+    periods_per_year : int
+        Number of periods per year (252 for daily, 12 for monthly, etc.).
+
+    Returns
+    -------
+    dict
+        {
+          "weights": { "TICKER": float, ... },
+          "sharpe": float,
+          "ann_vol": float,
+          "ann_return": float,
+          "solver": "Sharpe_SLSQP",
+          "success": bool,
+          "summary": str,
+        }
+
+    Notes
+    -----
+    - Long-only, fully-invested (weights in [0,1], sum to 1).
+    - Pure math: no network calls, deterministic for given inputs.
+    - Output is JSON-serializable and agent-friendly.
+    """
+    R = _ensure_2d_frame(returns)
+    names = list(R.columns)
+    n = len(names)
+    if n == 0:
+        raise ValueError("No assets provided for Sharpe optimization.")
+
+    # Per-period mean returns & covariance
+    mu = R.mean().values          # shape (n,)
+    cov = R.cov().values          # shape (n, n)
+
+    if np.any(~np.isfinite(mu)) or np.any(~np.isfinite(cov)):
+        raise ValueError("Non-finite values detected in returns; cannot optimize Sharpe.")
+
+    # Initial guess: equal-weight portfolio
+    w0 = np.ones(n) / n
+
+    def portfolio_ann_stats(w: np.ndarray) -> Tuple[float, float]:
+        """
+        Compute annualized (return, volatility) for weights w.
+        """
+        w = np.asarray(w)
+        ret_period = float(np.dot(w, mu))
+        vol_period = float(np.sqrt(np.dot(w.T, np.dot(cov, w)))) if n > 0 else 0.0
+
+        ann_return = ret_period * periods_per_year
+        ann_vol = vol_period * np.sqrt(periods_per_year) if vol_period > 0 else 0.0
+        return ann_return, ann_vol
+
+    def neg_sharpe(w: np.ndarray) -> float:
+        """
+        Objective for SLSQP: negative annualized Sharpe ratio.
+        """
+        ann_ret, ann_vol = portfolio_ann_stats(w)
+        if ann_vol <= 0:
+            # Penalize degenerate solutions to steer optimizer away.
+            return 1e6
+        return -((ann_ret - risk_free_rate) / ann_vol)
+
+    # Constraints: sum(weights) = 1
+    cons = ({
+        "type": "eq",
+        "fun": lambda w: float(np.sum(w) - 1.0),
+    },)
+
+    # Bounds: long-only, each weight in [0, 1]
+    bounds = tuple((0.0, 1.0) for _ in range(n))
+
+    try:
+        res = minimize(
+            neg_sharpe,
+            w0,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=cons,
+            options={"disp": False, "maxiter": 500},
+        )
+        success = bool(res.success)
+        w_opt = np.asarray(res.x).ravel() if res.x is not None else None
+    except Exception:
+        success = False
+        w_opt = None
+
+    solver_name = "Sharpe_SLSQP"
+
+    # Fallback: equal-weight portfolio if optimization fails
+    if (w_opt is None) or (not success) or (not np.all(np.isfinite(w_opt))):
+        w_fb = w0
+        ann_ret, ann_vol = portfolio_ann_stats(w_fb)
+        sharpe = (ann_ret - risk_free_rate) / (ann_vol + 1e-12) if ann_vol > 0 else 0.0
+
+        weights = {
+            names[i]: float(np.round(w_fb[i], 6))
+            for i in range(n)
+        }
+        summary = (
+            "Sharpe optimization failed; using equal-weight portfolio "
+            f"(SR={sharpe:.2f}, μₐ={ann_ret:.4f}, σₐ={ann_vol:.4f})."
+        )
+
+        return {
+            "weights": weights,
+            "sharpe": float(np.round(sharpe, 4)),
+            "ann_vol": float(np.round(ann_vol, 4)),
+            "ann_return": float(np.round(ann_ret, 4)),
+            "solver": solver_name,
+            "success": False,
+            "summary": summary,
+        }
+
+    # Normalize and sanitize optimized weights
+    w_opt = np.clip(w_opt, 0.0, 1.0)
+    s = float(w_opt.sum())
+    if s <= 0:
+        w_opt = w0
+    else:
+        w_opt = w_opt / s
+
+    ann_ret, ann_vol = portfolio_ann_stats(w_opt)
+    sharpe = (ann_ret - risk_free_rate) / (ann_vol + 1e-12) if ann_vol > 0 else 0.0
+
+    weights = {
+        names[i]: float(np.round(w_opt[i], 6))
+        for i in range(n)
+    }
+
+    summary = (
+        f"Sharpe optimization succeeded using SLSQP (SR={sharpe:.2f}, "
+        f"μₐ={ann_ret:.4f}, σₐ={ann_vol:.4f})."
+    )
+
+    return {
+        "weights": weights,
+        "sharpe": float(np.round(sharpe, 4)),
+        "ann_vol": float(np.round(ann_vol, 4)),
+        "ann_return": float(np.round(ann_ret, 4)),
+        "solver": solver_name,
+        "success": True,
+        "summary": summary,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Minimum-Variance Baseline
 # --------------------------------------------------------------------------- #
 def sample_min_variance_weights(returns: pd.DataFrame) -> pd.Series:
     """
-    Compute minimum-variance weights (long-only, fully invested) as a simple baseline.
+    Compute minimum-variance weights (long-only, fully invested) as a baseline.
+
+    This is useful for comparison in dashboards and tests to benchmark
+    more advanced optimizers like CVaR and Sharpe.
     """
     R = _ensure_2d_frame(returns)
     cov = np.cov(R.values, rowvar=False)
     cov = np.asarray(cov)
     N = cov.shape[0]
+
     w = cp.Variable(N)
     cons = [cp.sum(w) == 1, w >= 0]
     prob = cp.Problem(cp.Minimize(cp.quad_form(w, cov)), cons)
     prob.solve(solver=cp.ECOS, verbose=False)
+
     if w.value is None:
         raise RuntimeError("Min-variance optimization failed.")
+
     arr = np.asarray(w.value).ravel()
     arr = arr / arr.sum()
     return pd.Series(arr, index=R.columns, name="min_var_weight")
+
+
+# --------------------------------------------------------------------------- #
+# Inline Quick-Check (Local Only)
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    # Simple smoke tests to validate shapes and outputs.
+    np.random.seed(42)
+    sample_returns = pd.DataFrame(
+        np.random.randn(252, 3) / 100,
+        columns=["AAPL", "MSFT", "GOOG"],
+    )
+
+    print("=== Sharpe Optimizer Smoke Test ===")
+    sharpe_res = optimize_sharpe(sample_returns, risk_free_rate=0.02)
+    print(sharpe_res)
+
+    print("\n=== CVaR Optimizer Smoke Test ===")
+    cvar_res = optimize_cvar(sample_returns, alpha=0.95, constraints={"as_dict": True})
+    print(cvar_res)
