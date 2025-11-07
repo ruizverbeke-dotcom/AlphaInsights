@@ -1,74 +1,69 @@
 """
 supabase/config.py
 ------------------
-Supabase integration scaffold for AlphaInsights (Phase 4.4)
-------------------------------------------------------------
-This module defines environment-safe configuration and lazy client initialization.
-It does not connect yet; full integration arrives in Phase 5 (Cloud Persistence).
+Secure Supabase configuration and connectivity layer (Phase 5.0).
+
+• Reads credentials from environment variables (never hard-coded).
+• Verifies connection health non-destructively.
+• Used by backend & analytics for profile persistence.
 
 Environment variables expected:
-- SUPABASE_URL
-- SUPABASE_KEY
+    SUPABASE_URL      → Supabase project URL
+    SUPABASE_KEY      → Supabase service role or anon key
 """
 
 import os
-from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Any
 
-# Optional import guard — only needed when actual client is installed in Phase 5
 try:
-    from supabase import create_client, Client
-except ImportError:  # Safe placeholder
-    Client = None
+    from supabase import create_client, Client  # type: ignore
+except ImportError:
     create_client = None
+    Client = None
 
 
-@dataclass(frozen=True)
-class SupabaseConfig:
-    """Holds Supabase credentials loaded from environment variables."""
-    url: Optional[str] = os.getenv("SUPABASE_URL")
-    key: Optional[str] = os.getenv("SUPABASE_KEY")
+def get_supabase_client() -> "Client | None":
+    """Create and return a Supabase client if credentials exist."""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
 
-    @property
-    def is_configured(self) -> bool:
-        """True if both URL and KEY are present."""
-        return bool(self.url and self.key)
-
-
-def get_supabase_client() -> Optional["Client"]:
-    """
-    Initialize a Supabase client if credentials exist.
-    Returns None if environment variables are missing or client is unavailable.
-    """
-    cfg = SupabaseConfig()
-    if not cfg.is_configured:
-        print("⚠️ Supabase credentials not configured. Skipping client init.")
+    if not url or not key:
         return None
 
     if create_client is None:
-        print("⚙️ Supabase Python SDK not installed yet (Phase 5). Returning None.")
-        return None
+        raise ImportError("The 'supabase' Python SDK is not installed. Run: pip install supabase")
+
+    return create_client(url, key)
+
+
+def check_supabase_health() -> Dict[str, Any]:
+    """Perform a lightweight Supabase health check."""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+
+    health = {
+        "configured": bool(url and key),
+        "url_set": bool(url),
+        "key_set": bool(key),
+        "connected": False,
+        "error": None,
+        "phase": "5.0 (bootstrap)",
+    }
+
+    if not url or not key or create_client is None:
+        return health
 
     try:
-        client = create_client(cfg.url, cfg.key)
-        print("✅ Supabase client initialized successfully.")
-        return client
+        client = create_client(url, key)
+        # Non-destructive query to validate connection
+        client.table("pg_catalog.pg_tables").select("*").limit(1).execute()
+        health["connected"] = True
     except Exception as e:
-        print(f"❌ Supabase client initialization failed: {e}")
-        return None
+        health["error"] = str(e)
 
-
-def get_status() -> dict:
-    """Lightweight health probe."""
-    cfg = SupabaseConfig()
-    return {
-        "configured": cfg.is_configured,
-        "url_set": bool(cfg.url),
-        "key_set": bool(cfg.key),
-        "phase": "4.4 (scaffold)",
-    }
+    return health
 
 
 if __name__ == "__main__":
-    # Quick self-test when running `python supabase/config.py`
-    print("Supabase Config Health →", get_status())
+    import json
+    print(json.dumps(check_supabase_health(), indent=2))
