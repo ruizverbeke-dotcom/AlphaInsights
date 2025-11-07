@@ -14,6 +14,12 @@ from functools import lru_cache
 
 # --- Common index / ETF / commodity aliases ---
 STATIC_MAP = {
+    # companies
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "google": "GOOG",
+    "yahoo": "YHOO",
+
     # indices
     "s&p500": "^GSPC",
     "sp500": "^GSPC",
