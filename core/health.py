@@ -1,71 +1,66 @@
 """
-core/health.py
---------------
-System-wide health diagnostics for AlphaInsights.
+AlphaInsights Core Health Monitor
+---------------------------------
+Phase 5.2 — integrated with Safe Cloud Activation Layer (core.safe_connect).
 
-Checks:
-- Core metadata integrity
-- Backend availability (FastAPI app import check)
-- Supabase configuration (Phase 5)
+This script checks:
+- Core metadata availability
+- Backend presence
+- Supabase configuration and safe connection
+- Overall system status (ready, degraded, or offline)
 """
 
-from datetime import datetime, timezone
-from typing import Dict
+from __future__ import annotations
 import importlib.util
+import json
 import os
 import sys
-import json
+from datetime import datetime, UTC
 
+# --- Ensure root path for imports ---
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# --- Ensure project root is importable ---
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
-
-
-def check_core_metadata() -> bool:
-    """Verify that core metadata exists and contains required fields."""
-    try:
-        from core.metadata import get_metadata
-        meta = get_metadata()
-        required = {"project", "version", "phase", "maintainer"}
-        return all(k in meta for k in required)
-    except Exception:
-        return False
+from core.metadata import get_metadata
+from supabase.config import get_supabase_config
+from core.safe_connect import test_connection as safe_connect_status
 
 
 def check_backend_available() -> bool:
-    """Check whether backend.main FastAPI app is importable."""
-    try:
-        spec = importlib.util.find_spec("backend.main")
-        return spec is not None
-    except Exception:
-        return False
+    """Check if backend module is importable."""
+    return importlib.util.find_spec("backend.main") is not None
 
 
-def check_supabase_configured() -> bool:
-    """Check if Supabase configuration exists and has valid attributes."""
-    try:
-        from supabase.config import check_supabase_health
-        health = check_supabase_health()
-        return bool(health.get("configured"))
-    except Exception:
-        return False
+def system_health() -> dict:
+    """Aggregate all component health signals."""
+    supabase_cfg = get_supabase_config()
+    supabase_safe = safe_connect_status()
 
-
-def system_health() -> Dict[str, object]:
-    """Return overall system health snapshot."""
-    core_ok = check_core_metadata()
-    backend_ok = check_backend_available()
-    supabase_ok = check_supabase_configured()
-
-    return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "core_metadata": core_ok,
-        "backend_available": backend_ok,
-        "supabase_configured": supabase_ok,
-        "status": "ok" if core_ok and backend_ok else "warning",
+    status = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "core_metadata": bool(get_metadata()),
+        "backend_available": check_backend_available(),
+        "supabase_configured": supabase_cfg.get("configured", False),
+        "supabase_connected": supabase_safe.get("connected", False),
+        "phase": "5.2 (core-cloud integrated)",
+        "status": "ok",
     }
+
+    # Adjust overall status dynamically
+    if not status["backend_available"]:
+        status["status"] = "degraded"
+    if not status["core_metadata"]:
+        status["status"] = "critical"
+    if not status["supabase_configured"]:
+        status["status"] = "limited"
+
+    # Merge diagnostic info
+    status["cloud_detail"] = {
+        "detected": supabase_safe.get("supabase_detected"),
+        "credentials_present": supabase_safe.get("credentials_present"),
+        "error": supabase_safe.get("error"),
+    }
+
+    return status
 
 
 if __name__ == "__main__":
