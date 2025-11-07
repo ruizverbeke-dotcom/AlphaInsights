@@ -47,7 +47,6 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
-
 from scipy.optimize import minimize
 
 try:
@@ -353,15 +352,21 @@ def optimize_cvar(
 
 
 # --------------------------------------------------------------------------- #
-# Sharpe Ratio Optimizer (Phase 6.0)
+# Sharpe Ratio Optimizer (Phase 6.0) — backend-compatible
 # --------------------------------------------------------------------------- #
 def optimize_sharpe(
     returns: pd.DataFrame,
     risk_free_rate: float = 0.0,
     periods_per_year: int = 252,
+    **kwargs,
 ) -> Dict[str, Union[dict, float, str, bool]]:
     """
     Maximize the portfolio's annualized Sharpe Ratio using SLSQP.
+
+    Backend compatibility
+    ---------------------
+    - Accepts both `risk_free_rate` (preferred) and `risk_free` (alias via kwargs),
+      so FastAPI endpoints and other agents can call it flexibly.
 
     Parameters
     ----------
@@ -384,13 +389,13 @@ def optimize_sharpe(
           "success": bool,
           "summary": str,
         }
-
-    Notes
-    -----
-    - Long-only, fully-invested (weights in [0,1], sum to 1).
-    - Pure math: no network calls, deterministic for given inputs.
-    - Output is JSON-serializable and agent-friendly.
     """
+    # Allow alias: risk_free from kwargs (e.g. optimize_sharpe(..., risk_free=0.02))
+    if "risk_free" in kwargs and kwargs["risk_free"] is not None:
+        rf = float(kwargs["risk_free"])
+    else:
+        rf = float(risk_free_rate)
+
     R = _ensure_2d_frame(returns)
     names = list(R.columns)
     n = len(names)
@@ -413,7 +418,9 @@ def optimize_sharpe(
         """
         w = np.asarray(w)
         ret_period = float(np.dot(w, mu))
-        vol_period = float(np.sqrt(np.dot(w.T, np.dot(cov, w)))) if n > 0 else 0.0
+        vol_period = float(
+            np.sqrt(np.dot(w.T, np.dot(cov, w)))
+        ) if n > 0 else 0.0
 
         ann_return = ret_period * periods_per_year
         ann_vol = vol_period * np.sqrt(periods_per_year) if vol_period > 0 else 0.0
@@ -427,13 +434,10 @@ def optimize_sharpe(
         if ann_vol <= 0:
             # Penalize degenerate solutions to steer optimizer away.
             return 1e6
-        return -((ann_ret - risk_free_rate) / ann_vol)
+        return -((ann_ret - rf) / ann_vol)
 
     # Constraints: sum(weights) = 1
-    cons = ({
-        "type": "eq",
-        "fun": lambda w: float(np.sum(w) - 1.0),
-    },)
+    cons = ({"type": "eq", "fun": lambda w: float(np.sum(w) - 1.0)},)
 
     # Bounds: long-only, each weight in [0, 1]
     bounds = tuple((0.0, 1.0) for _ in range(n))
@@ -459,12 +463,9 @@ def optimize_sharpe(
     if (w_opt is None) or (not success) or (not np.all(np.isfinite(w_opt))):
         w_fb = w0
         ann_ret, ann_vol = portfolio_ann_stats(w_fb)
-        sharpe = (ann_ret - risk_free_rate) / (ann_vol + 1e-12) if ann_vol > 0 else 0.0
+        sharpe = (ann_ret - rf) / (ann_vol + 1e-12) if ann_vol > 0 else 0.0
 
-        weights = {
-            names[i]: float(np.round(w_fb[i], 6))
-            for i in range(n)
-        }
+        weights = {names[i]: float(np.round(w_fb[i], 6)) for i in range(n)}
         summary = (
             "Sharpe optimization failed; using equal-weight portfolio "
             f"(SR={sharpe:.2f}, μₐ={ann_ret:.4f}, σₐ={ann_vol:.4f})."
@@ -489,12 +490,9 @@ def optimize_sharpe(
         w_opt = w_opt / s
 
     ann_ret, ann_vol = portfolio_ann_stats(w_opt)
-    sharpe = (ann_ret - risk_free_rate) / (ann_vol + 1e-12) if ann_vol > 0 else 0.0
+    sharpe = (ann_ret - rf) / (ann_vol + 1e-12) if ann_vol > 0 else 0.0
 
-    weights = {
-        names[i]: float(np.round(w_opt[i], 6))
-        for i in range(n)
-    }
+    weights = {names[i]: float(np.round(w_opt[i], 6)) for i in range(n)}
 
     summary = (
         f"Sharpe optimization succeeded using SLSQP (SR={sharpe:.2f}, "
