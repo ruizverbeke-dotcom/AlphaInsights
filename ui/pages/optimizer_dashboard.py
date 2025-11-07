@@ -26,6 +26,10 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 import requests
+from streamlit_autorefresh import st_autorefresh
+
+# --- Auto refresh must be at top level ---
+st_autorefresh(interval=60 * 1000, key="page_autorefresh")
 
 # --- import project root ---
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -45,36 +49,16 @@ def _call_cvar_api(
     end_date: str,
     alpha: float,
 ) -> dict:
-    """
-    Call the AlphaInsights Backend CVaR endpoint.
-
-    Parameters
-    ----------
-    tickers : list[str]
-        Resolved tickers to optimize over.
-    start_date : str
-        ISO date (YYYY-MM-DD).
-    end_date : str
-        ISO date (YYYY-MM-DD).
-    alpha : float
-        Confidence level for CVaR.
-
-    Returns
-    -------
-    dict
-        Raw JSON payload from the backend with keys:
-        weights, es, var, ann_vol, solver, success, summary.
-    """
+    """Call the AlphaInsights Backend CVaR endpoint."""
     payload = {
         "tickers": tickers,
         "start": start_date,
         "end": end_date,
         "alpha": float(alpha),
     }
-
     try:
         resp = requests.post(f"{BACKEND_URL}/optimize/cvar", json=payload, timeout=30)
-    except requests.RequestException as exc:  # network / connection issues
+    except requests.RequestException as exc:
         raise RuntimeError(f"Failed to reach backend API at {BACKEND_URL}: {exc}") from exc
 
     if resp.status_code != 200:
@@ -84,15 +68,11 @@ def _call_cvar_api(
     required_keys = {"weights", "es", "var", "ann_vol", "solver", "success", "summary"}
     if not required_keys.issubset(data.keys()):
         raise RuntimeError(f"Backend response missing keys. Got: {sorted(data.keys())}")
-
     return data
 
 
 def _ping_backend_health() -> dict:
-    """
-    Query the backend /health endpoint to verify system status.
-    Returns a parsed dictionary or raises a RuntimeError on failure.
-    """
+    """Query the backend /health endpoint to verify system status."""
     try:
         resp = requests.get(f"{BACKEND_URL}/health", timeout=5)
         if resp.status_code == 200:
@@ -158,7 +138,6 @@ if run_button:
     if not tickers_input.strip():
         st.error("Please enter at least one ticker or name.")
         st.stop()
-
     if start_date >= end_date:
         st.error("Start Date must be strictly before End Date.")
         st.stop()
@@ -202,25 +181,20 @@ if run_button:
     st.subheader("Optimization Summary")
     st.write(result["summary"])
 
-    # Weights → DataFrame
     weights_dict = result.get("weights", {})
     weights = pd.DataFrame.from_dict(weights_dict, orient="index", columns=["Weight"])
-
-    # 1-D safety & display
     weights["Weight"] = weights["Weight"].astype(float)
     st.dataframe(weights.style.format("{:.4f}"))
 
-    # Metrics row
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Expected Shortfall (ES)", f"{result['es']:.4f}")
     c2.metric("Value-at-Risk (VaR)", f"{result['var']:.4f}")
     c3.metric("Annualized Volatility", f"{result['ann_vol']:.4f}")
     c4.metric("Solver", result["solver"] or "N/A")
 
-    # --- Plot Weights (1-D safe) ---
+    # --- Plot Weights ---
     weights_plot = weights.reset_index().rename(columns={"index": "Asset"})
     weights_plot["Weight"] = weights_plot["Weight"].clip(lower=0.0)
-
     fig = px.bar(
         weights_plot,
         x="Asset",
@@ -236,21 +210,34 @@ else:
         "making it deployment-ready and agent-friendly."
     )
 
+
 # --------------------------------------------------------------------------- #
-# Backend Health Check (Phase 5.4)
+# Backend Health Monitor (Phase 5.6 Final — True Auto-Refresh)
 # --------------------------------------------------------------------------- #
 st.sidebar.markdown("---")
-st.sidebar.subheader("🩺 System Health")
+st.sidebar.subheader("🩺 System Health (auto-refreshes every 60 s)")
 
-if st.sidebar.button("Check Backend Health"):
+if "last_health_data" not in st.session_state:
+    st.session_state.last_health_data = None
+
+def _refresh_health():
     try:
-        health = _ping_backend_health()
-        st.sidebar.success(f"✅ Backend OK — {health.get('status', 'unknown').upper()}")
-        st.sidebar.write(f"**Phase:** {health.get('phase', 'N/A')}")
-        st.sidebar.write(f"**Time:** {health.get('timestamp', 'N/A')}")
-        st.sidebar.json(health)
+        st.session_state.last_health_data = _ping_backend_health()
     except Exception as e:
-        st.sidebar.error(f"❌ {e}")
+        st.session_state.last_health_data = {"status": "error", "error": str(e)}
+
+_refresh_health()
+
+data = st.session_state.last_health_data
+if data:
+    status = data.get("status", "N/A").upper()
+    phase = data.get("phase", "N/A")
+    timestamp = data.get("timestamp", "N/A")
+    st.sidebar.success(f"✅ Backend {status}")
+    st.sidebar.write(f"**Phase:** {phase}")
+    st.sidebar.write(f"**Time:** {timestamp}")
+else:
+    st.sidebar.warning("No health data yet. Click Refresh or wait 60 s.")
 
 # --------------------------------------------------------------------------- #
 # End of File
