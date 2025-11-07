@@ -12,7 +12,9 @@ __pycache__/
 # IDE & System Files
 # ===============================
 .idea/
+.vscode/
 .DS_Store
+Thumbs.db
 *.swp
 *.swo
 
@@ -22,6 +24,8 @@ __pycache__/
 data/cache/
 data/processed/
 reports/
+reports/excel_exports/*
+reports/pdf_reports/*
 *.xlsx
 *.pdf
 *.png
@@ -32,3 +36,38 @@ reports/
 # ===============================
 .streamlit/
 logs/
+
+# ===============================
+# --- AlphaInsights Documentation & Branding ---
+# ===============================
+# Ignore temporary / backup / autosave files in docs
+docs/~$*.docx
+docs/*.tmp
+docs/*.bak
+docs/*backup*
+docs/*.pdf~
+docs/*.docx~
+docs/*.pptx~
+docs/*.rtf~
+docs/*.old
+docs/*.DS_Store
+
+# Ignore Canva exports or temporary drafts
+docs/exports/
+docs/drafts/
+docs/_templates/
+docs/_scratch/
+
+# ===============================
+# Database Safety
+# ===============================
+database/alphainsights.db
+*.sqlite
+*.sqlite3
+
+# ===============================
+# OS or Miscellaneous Artifacts
+# ===============================
+*.log
+*.tmp
+*.bak
