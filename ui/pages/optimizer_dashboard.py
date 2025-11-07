@@ -3,72 +3,92 @@ AlphaInsights Optimizer Dashboard
 ---------------------------------
 Streamlit interface for the CVaR (Expected Shortfall) optimizer.
 
-This page lets users:
-- Enter tickers and a date range.
-- Choose tail confidence level α (0.90–0.995).
-- Toggle "Use Active Profile" if one exists in session state.
-- Optionally specify max weight caps and exclusions.
-- Run optimization and view results (weights, ES, VaR, Vol).
+Now operates as a thin client:
 
-Agent-ready design: produces deterministic metrics for the Optimizer Agent.
+UI (this page) → Backend API (FastAPI) → Analytics Engine (optimize_cvar).
+
+Responsibilities:
+- Parse and resolve user inputs (tickers, names like 'Microsoft', 'CAC 40', 'Gold').
+- Call the backend /optimize/cvar endpoint with canonical tickers & parameters.
+- Display returned weights and risk metrics (ES, VaR, annualized vol).
+
+All heavy lifting (data fetch, returns, optimization) happens in the backend.
 """
 
 import sys
 import os
+from typing import List
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import yfinance as yf
 import plotly.express as px
+import requests
 
 # --- import project root ---
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
-from analytics.optimization import optimize_cvar
 from ui.components.data_resolver import resolve_tickers  # intelligent name resolver
 
+# Backend base URL (can be overridden via environment for deployment)
+BACKEND_URL = os.getenv("ALPHAINSIGHTS_API_URL", "http://127.0.0.1:8000")
+
+
 # --------------------------------------------------------------------------- #
-# Utility
+# Helpers
 # --------------------------------------------------------------------------- #
-def _load_price_data(tickers: list[str], start: str, end: str) -> pd.DataFrame:
+def _call_cvar_api(
+    tickers: List[str],
+    start_date: str,
+    end_date: str,
+    alpha: float,
+) -> dict:
     """
-    Download adjusted close data using yfinance, with intelligent NaN filtering.
+    Call the AlphaInsights Backend CVaR endpoint.
 
-    Behavior:
-    - Ensures DataFrame shape even for single tickers.
-    - Drops tickers that return all NaNs (unavailable feeds).
-    - Drops rows with partial NaNs (mixed calendars/holidays) to align series.
-    - Raises a clear error only if nothing usable remains.
+    Parameters
+    ----------
+    tickers : list[str]
+        Resolved tickers to optimize over.
+    start_date : str
+        ISO date (YYYY-MM-DD).
+    end_date : str
+        ISO date (YYYY-MM-DD).
+    alpha : float
+        Confidence level for CVaR.
+
+    Returns
+    -------
+    dict
+        Raw JSON payload from the backend with keys:
+        weights, es, var, ann_vol, solver, success, summary.
     """
-    data = yf.download(
-        tickers, start=start, end=end, progress=False, auto_adjust=True
-    )["Close"]
+    payload = {
+        "tickers": tickers,
+        "start": start_date,
+        "end": end_date,
+        "alpha": float(alpha),
+    }
 
-    if isinstance(data, pd.Series):
-        data = data.to_frame()
+    try:
+        resp = requests.post(f"{BACKEND_URL}/optimize/cvar", json=payload, timeout=30)
+    except requests.RequestException as exc:  # network / connection issues
+        raise RuntimeError(f"Failed to reach backend API at {BACKEND_URL}: {exc}") from exc
 
-    # Identify and drop tickers with all NaNs
-    all_nan_cols = [c for c in data.columns if data[c].isna().all()]
-    if all_nan_cols:
-        st.warning(f"Dropping tickers with no valid data: {', '.join(map(str, all_nan_cols))}")
-        data = data.drop(columns=all_nan_cols)
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"Backend error {resp.status_code}: {resp.text}"
+        )
 
-    # Drop rows with partial NaNs (different trading calendars)
-    data = data.dropna(how="any")
+    data = resp.json()
+    # Minimal schema validation
+    required_keys = {"weights", "es", "var", "ann_vol", "solver", "success", "summary"}
+    if not required_keys.issubset(data.keys()):
+        raise RuntimeError(
+            f"Backend response missing keys. Got: {sorted(data.keys())}"
+        )
 
-    if data.empty:
-        raise ValueError("No valid price data remaining after cleanup.")
     return data
-
-
-def _compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute log returns from price data with strict 1-D safety before math.
-    """
-    prices = prices.squeeze("columns") if isinstance(prices, pd.DataFrame) else prices
-    returns = np.log(prices / prices.shift(1)).dropna()
-    returns = returns.squeeze("columns") if isinstance(returns, pd.DataFrame) else returns
-    return pd.DataFrame(returns)
 
 
 # --------------------------------------------------------------------------- #
@@ -96,12 +116,26 @@ alpha = st.sidebar.slider("Confidence Level α", 0.90, 0.995, 0.95, 0.005)
 use_profile = False
 if "active_profile_id" in st.session_state:
     use_profile = st.sidebar.checkbox(
-        f"Use Active Profile (ID {st.session_state['active_profile_id']})", value=False
+        f"Use Active Profile (ID {st.session_state['active_profile_id']})",
+        value=False,
+        help="(Planned) Use constraints from the active profile.",
     )
 
-st.sidebar.markdown("**Optional Constraints**")
-max_weight = st.sidebar.number_input("Global Max Weight", 0.0, 1.0, 1.0, 0.05)
-excl_text = st.sidebar.text_input("Exclude Tickers", placeholder="e.g. TSLA, NVDA")
+st.sidebar.markdown("**Optional (UI-only for now)**")
+max_weight = st.sidebar.number_input(
+    "Global Max Weight (not yet enforced by backend)",
+    0.0,
+    1.0,
+    1.0,
+    0.05,
+    help="Displayed for future integration; currently not wired into API.",
+)
+excl_text = st.sidebar.text_input(
+    "Exclude Tickers (not yet enforced by backend)",
+    placeholder="e.g. TSLA, NVDA",
+    help="Planned: pass to backend constraints.",
+)
+
 run_button = st.sidebar.button("🚀 Run Optimization", type="primary")
 
 
@@ -109,84 +143,87 @@ run_button = st.sidebar.button("🚀 Run Optimization", type="primary")
 # Main Execution
 # --------------------------------------------------------------------------- #
 if run_button:
-    # --- Step 1: Intelligently resolve tickers ---
+    # --- Step 1: Validate basic inputs ---
     if not tickers_input.strip():
-        st.error("Please enter at least one ticker.")
+        st.error("Please enter at least one ticker or name.")
         st.stop()
 
+    if start_date >= end_date:
+        st.error("Start Date must be strictly before End Date.")
+        st.stop()
+
+    # --- Step 2: Intelligent ticker resolution ---
     with st.spinner("Resolving tickers..."):
         try:
             resolved, dropped = resolve_tickers(
-                tickers_input, start=str(start_date), end=str(end_date)
+                tickers_input,
+                start=str(start_date),
+                end=str(end_date),
             )
         except Exception as e:
             st.error(f"Ticker resolution failed: {e}")
             st.stop()
 
     if not resolved:
-        st.error("No valid tickers could be resolved. Please adjust inputs.")
+        st.error("No valid tickers could be resolved. Please adjust your input.")
+        if dropped:
+            st.info(f"Tried and dropped: {', '.join(dropped)}")
         st.stop()
 
     st.success(f"Resolved tickers: {', '.join(resolved)}")
     if dropped:
-        st.warning(f"Dropping tickers with no valid data: {', '.join(dropped)}")
+        st.warning(f"Dropped tickers with no usable data: {', '.join(dropped)}")
 
-    tickers = resolved
-
-    # --- Step 2: Fetch data (resilient to missing calendars/feeds) ---
-    with st.spinner("Fetching price data..."):
+    # --- Step 3: Call backend CVaR optimizer ---
+    with st.spinner("Calling backend CVaR optimizer..."):
         try:
-            prices = _load_price_data(tickers, str(start_date), str(end_date))
+            result = _call_cvar_api(
+                tickers=resolved,
+                start_date=str(start_date),
+                end_date=str(end_date),
+                alpha=float(alpha),
+            )
         except Exception as e:
-            st.error(f"Data fetch failed: {e}")
+            st.error(str(e))
             st.stop()
 
-    # --- Step 3: Compute returns ---
-    returns = _compute_returns(prices)
-
-    # --- Step 4: Prepare constraints ---
-    constraints = {
-        "max_weight": float(max_weight),
-        "excludes": [t.strip().upper() for t in excl_text.split(",") if t.strip()],
-        "as_dict": False,
-    }
-
-    # --- Step 5: Run optimization ---
-    with st.spinner("Running CVaR Optimization..."):
-        result = optimize_cvar(returns, alpha=alpha, constraints=constraints)
-
-    # --- Step 6: Display Results ---
+    # --- Step 4: Display results ---
     st.subheader("Optimization Summary")
     st.write(result["summary"])
 
-    weights = (
-        pd.DataFrame(result["weights"], index=["Weight"]).T
-        if isinstance(result["weights"], dict)
-        else result["weights"].to_frame("Weight")
-    )
+    # Weights → DataFrame
+    weights_dict = result.get("weights", {})
+    weights = pd.DataFrame.from_dict(weights_dict, orient="index", columns=["Weight"])
 
+    # 1-D safety & display
+    weights["Weight"] = weights["Weight"].astype(float)
     st.dataframe(weights.style.format("{:.4f}"))
 
-    # Display metrics
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Expected Shortfall (ES)", f"{result['es']:.4f}")
-    col2.metric("Value-at-Risk (VaR)", f"{result['var']:.4f}")
-    col3.metric("Annualized Volatility", f"{result['ann_vol']:.4f}")
-    col4.metric("Solver", result["solver"])
+    # Metrics row
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Expected Shortfall (ES)", f"{result['es']:.4f}")
+    c2.metric("Value-at-Risk (VaR)", f"{result['var']:.4f}")
+    c3.metric("Annualized Volatility", f"{result['ann_vol']:.4f}")
+    c4.metric("Solver", result["solver"] or "N/A")
 
-    # --- Plot Weights ---
-    weights_reset = weights.reset_index().rename(columns={"index": "Asset"})
-    weights_reset["Weight"] = weights_reset["Weight"].astype(float).clip(lower=0)
+    # --- Plot Weights (1-D safe) ---
+    weights_plot = weights.reset_index().rename(columns={"index": "Asset"})
+    weights_plot["Weight"] = weights_plot["Weight"].clip(lower=0.0)
+
     fig = px.bar(
-        weights_reset,
+        weights_plot,
         x="Asset",
         y="Weight",
-        title=f"Optimized Portfolio Weights (α={alpha:.3f})",
+        title=f"Optimized Portfolio Weights via Backend (α={alpha:.3f})",
     )
     st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("Enter tickers, date range, and parameters, then click **Run Optimization**.")
+    st.info(
+        "Enter tickers, select a date range and α, then click **Run Optimization**.\n\n"
+        "This dashboard now calls the AlphaInsights Backend API, "
+        "making it deployment-ready and agent-friendly."
+    )
 
 # --------------------------------------------------------------------------- #
 # End of File
