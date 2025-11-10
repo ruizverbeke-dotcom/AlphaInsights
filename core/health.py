@@ -21,7 +21,7 @@ from datetime import datetime, UTC
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core.metadata import get_metadata
-from supabase.config import get_supabase_config
+from supabase_client.config import get_supabase_client
 from core.safe_connect import test_connection as safe_connect_status
 
 

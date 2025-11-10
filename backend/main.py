@@ -14,6 +14,10 @@ Phase 6.0–6.2 Summary
     • Drops illiquid / broken series with too little data.
 - Delegates Sharpe optimization core logic to analytics.optimization.optimize_sharpe.
 - Designed to be agent-ready: typed models, stable JSON schemas, deterministic math.
+
+Phase 6.3 Extension
+-------------------
+- Adds optional Supabase logging for optimizer calls (non-fatal, best-effort).
 """
 
 from __future__ import annotations
@@ -40,16 +44,23 @@ from core.health import system_health
 from core.symbol_resolver import resolve_tickers
 from analytics.optimization import optimize_sharpe  # Sharpe optimizer core (Phase 6.0+)
 
+# Phase 6.3: Supabase logging helper (optional, best-effort)
+try:
+    from supabase_client.helpers import insert_record
+except ImportError:  # keep backend working even if supabase_client is absent
+    insert_record = None  # type: ignore
+    print("[Supabase] helpers not available; logging disabled.")
+
 # --------------------------------------------------------------------------- #
 # FastAPI App
 # --------------------------------------------------------------------------- #
 
 app = FastAPI(
     title="AlphaInsights Backend API",
-    version="1.2",
+    version="1.3",
     description=(
         "FastAPI synchronization layer for CVaR, Sharpe, and future analytics endpoints. "
-        "Uses shared symbol resolution and robust data loading."
+        "Uses shared symbol resolution, robust data loading, and optional Supabase logging."
     ),
 )
 
@@ -161,7 +172,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             progress=False,
             auto_adjust=False,
             threads=True,
-            timeout=60,  # increased to avoid unnecessary timeouts on multi-asset queries
+            timeout=60,  # avoid unnecessary timeouts on multi-asset queries
         )
     except Exception as e:
         raise HTTPException(
@@ -355,6 +366,7 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
     - Resolves tickers via shared resolver.
     - Loads and cleans return series.
     - Runs local SLSQP-based CVaR optimizer.
+    - Logs request/response to Supabase (if configured).
     """
     try:
         alpha = request.alpha if request.alpha is not None else 0.95
@@ -368,7 +380,7 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
             f"ES={es:.4f}, VaR={var:.4f}, σₐ={ann_vol:.4f}."
         )
 
-        return {
+        result = {
             "weights": weights,
             "es": es,
             "var": var,
@@ -377,6 +389,25 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
             "success": success,
             "summary": summary,
         }
+
+        # Optional Supabase logging
+        if insert_record is not None:
+            try:
+                insert_record(
+                    "optimizer_logs",
+                    {
+                        "endpoint": "cvar",
+                        "tickers": request.tickers,
+                        "start": request.start,
+                        "end": request.end,
+                        "alpha": request.alpha,
+                        "result": result,
+                    },
+                )
+            except Exception as log_err:
+                print(f"[Supabase] ⚠️ Logging failed (CVaR): {log_err}")
+
+        return result
 
     except HTTPException:
         raise
@@ -387,12 +418,13 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
 @app.post("/optimize/sharpe", response_model=SharpeResponse)
 async def optimize_sharpe_endpoint(request: OptimizeRequest):
     """
-    Sharpe optimizer endpoint (Phase 6.0–6.2).
+    Sharpe optimizer endpoint (Phase 6.0–6.3).
 
     - Resolves tickers via shared resolver.
     - Loads and cleans log returns.
     - Delegates to analytics.optimization.optimize_sharpe.
     - Returns stable, agent-friendly schema.
+    - Logs request/response to Supabase (if configured).
     """
     try:
         returns = _fetch_data(request.tickers, request.start, request.end)
@@ -402,8 +434,24 @@ async def optimize_sharpe_endpoint(request: OptimizeRequest):
         rf = float(request.rf) if request.rf is not None else 0.0
 
         # Call analytics.optimize_sharpe with explicit risk_free_rate keyword
-        # to avoid any ambiguity.
         result = optimize_sharpe(returns, risk_free_rate=rf)
+
+        # Optional Supabase logging
+        if insert_record is not None:
+            try:
+                insert_record(
+                    "optimizer_logs",
+                    {
+                        "endpoint": "sharpe",
+                        "tickers": request.tickers,
+                        "start": request.start,
+                        "end": request.end,
+                        "rf": request.rf,
+                        "result": result,
+                    },
+                )
+            except Exception as log_err:
+                print(f"[Supabase] ⚠️ Logging failed (Sharpe): {log_err}")
 
         return result
 

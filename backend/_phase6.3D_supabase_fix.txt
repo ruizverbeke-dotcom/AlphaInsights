@@ -1,0 +1,15 @@
+﻿# --- PATCH: enable Supabase logging (Phase 6.3D) ---
+from supabase_client.helpers import insert_record
+
+# inside your optimize_sharpe_endpoint (before return result)
+try:
+    insert_record("optimizer_logs", {
+        "endpoint": "sharpe",
+        "tickers": request.tickers,
+        "start": request.start,
+        "end": request.end,
+        "rf": request.rf,
+        "result": result,
+    })
+except Exception as log_err:
+    print(f"[Supabase] ⚠️ Logging failed: {log_err}")
