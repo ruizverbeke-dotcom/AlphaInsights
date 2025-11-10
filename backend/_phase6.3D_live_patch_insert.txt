@@ -1,0 +1,35 @@
+﻿# Phase 6.3D — Live backend Supabase persistence integration
+from supabase.helpers import insert_record
+
+# Add inside optimize_sharpe_endpoint (just before return)
+try:
+    insert_record("optimizer_logs", {
+        "endpoint": "sharpe",
+        "tickers": request.tickers,
+        "start": request.start,
+        "end": request.end,
+        "rf": request.rf,
+        "result": result,
+    })
+except Exception as log_err:
+    print(f"[Supabase] ⚠️ Logging failed: {log_err}")
+
+# Add inside optimize_cvar_endpoint (just before return)
+try:
+    insert_record("optimizer_logs", {
+        "endpoint": "cvar",
+        "tickers": request.tickers,
+        "start": request.start,
+        "end": request.end,
+        "alpha": request.alpha,
+        "result": {
+            "weights": weights,
+            "es": es,
+            "var": var,
+            "ann_vol": ann_vol,
+            "solver": solver,
+            "success": success,
+        },
+    })
+except Exception as log_err:
+    print(f"[Supabase] ⚠️ Logging failed: {log_err}")
