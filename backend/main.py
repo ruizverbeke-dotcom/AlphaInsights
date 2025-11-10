@@ -463,6 +463,31 @@ async def optimize_sharpe_endpoint(request: OptimizeRequest):
             detail=f"Sharpe optimization failed: {e}",
         )
 
+# --------------------------------------------------------------------------- #
+# Supabase Log Retrieval Endpoint (Phase 6.3F)
+# --------------------------------------------------------------------------- #
+
+@app.get("/logs/recent")
+async def get_recent_logs(limit: int = 10):
+    """
+    Retrieve the most recent optimizer logs from Supabase.
+
+    Parameters
+    ----------
+    limit : int
+        Number of records to fetch (default = 10).
+
+    Returns
+    -------
+    list[dict]
+        Recent log entries sorted by created_at (descending).
+    """
+    try:
+        from supabase_client.helpers import fetch_recent
+        logs = fetch_recent("optimizer_logs", limit=limit, debug=True)
+        return logs
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch logs: {e}")
 
 # --------------------------------------------------------------------------- #
 # End of File
