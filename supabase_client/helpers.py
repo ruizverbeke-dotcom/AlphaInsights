@@ -1,4 +1,4 @@
-﻿# supabase_client/helpers.py — Phase 6.3C
+﻿# supabase_client/helpers.py — Phase 6.3D (enhanced debug + safety)
 """
 Utility layer for interacting with Supabase.
 
@@ -7,26 +7,26 @@ Features
 - Safe, reusable wrappers for inserting and fetching records.
 - Graceful handling of transient errors (e.g., connection or schema issues).
 - Automatic timestamp fallback (for tables without default `created_at`).
-- Optional debug logging for local testing.
+- Optional verbose debug logging for diagnostics.
+- Structured return values for easier backend integration.
 
-Intended for backend analytics & optimizer logging (Phase 6.3+).
+Used by backend analytics & optimizer endpoints (Phase 6.3+).
 """
 
 from __future__ import annotations
 
 import datetime as dt
 from typing import Dict, Any, List, Optional
-
 from supabase_client.config import get_supabase_client
 
 
 def insert_record(
     table: str,
     data: Dict[str, Any],
-    debug: bool = False
+    debug: bool = True
 ) -> Dict[str, Any]:
     """
-    Insert a record into a Supabase table safely.
+    Insert a record into a Supabase table safely with debug support.
 
     Parameters
     ----------
@@ -35,55 +35,69 @@ def insert_record(
     data : dict
         Dictionary of column names and values.
     debug : bool
-        If True, prints status messages for local development.
+        If True, prints detailed output.
 
     Returns
     -------
     dict
-        Inserted record or empty dict if failed.
+        Inserted record data or empty dict on failure.
     """
     try:
         supabase = get_supabase_client()
 
-        # Add fallback timestamp if table expects it
+        # Add fallback timestamp if missing
         if "created_at" not in data:
             data["created_at"] = dt.datetime.utcnow().isoformat()
 
-        res = supabase.table(table).insert(data).execute()
         if debug:
-            print(f"[Supabase] ✅ Inserted into '{table}' → {res.data}")
+            print(f"[Supabase] → Inserting into '{table}' …")
+            print(f"[Supabase] Payload keys: {list(data.keys())}")
+
+        res = supabase.table(table).insert(data).execute()
+
+        if hasattr(res, "status_code") and res.status_code >= 400:
+            if debug:
+                print(f"[Supabase] ❌ HTTP {res.status_code}: {res.error_message if hasattr(res, 'error_message') else res}")
+            return {}
+
+        if debug:
+            print(f"[Supabase] ✅ Insert success → {res.data}")
+
         return res.data or {}
 
     except Exception as e:
         if debug:
-            print(f"[Supabase] ⚠️ Insert failed for '{table}': {e}")
+            print(f"[Supabase] ⚠️ Insert failed: {type(e).__name__}: {e}")
         return {}
 
 
 def fetch_recent(
     table: str,
     limit: int = 10,
-    debug: bool = False
+    debug: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Fetch the most recent records from a Supabase table.
+    Fetch recent records from a Supabase table.
 
     Parameters
     ----------
     table : str
         Table name.
     limit : int
-        Maximum number of rows to return.
+        Max rows to fetch.
     debug : bool
-        If True, prints query progress.
+        If True, print diagnostic info.
 
     Returns
     -------
     list[dict]
-        List of records (may be empty).
+        Records from Supabase or [] if empty/error.
     """
     try:
         supabase = get_supabase_client()
+        if debug:
+            print(f"[Supabase] → Fetching latest {limit} from '{table}'")
+
         res = (
             supabase.table(table)
             .select("*")
@@ -92,24 +106,26 @@ def fetch_recent(
             .execute()
         )
 
+        records = res.data or []
         if debug:
-            print(f"[Supabase] 🔍 Fetched {len(res.data or [])} records from '{table}'.")
-        return res.data or []
+            print(f"[Supabase] ← Got {len(records)} records")
+
+        return records
 
     except Exception as e:
         if debug:
-            print(f"[Supabase] ⚠️ Fetch failed for '{table}': {e}")
+            print(f"[Supabase] ⚠️ Fetch failed: {e}")
         return []
 
 
 def test_connection(debug: bool = True) -> Optional[str]:
     """
-    Quick sanity check to verify Supabase connection.
+    Verify Supabase client connectivity.
 
     Returns
     -------
     Optional[str]
-        Project URL if successful, None otherwise.
+        Supabase project URL if success, None if failure.
     """
     try:
         sb = get_supabase_client()

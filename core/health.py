@@ -1,67 +1,86 @@
 """
-AlphaInsights Core Health Monitor
----------------------------------
-Phase 5.2 — integrated with Safe Cloud Activation Layer (core.safe_connect).
+core/health.py — Phase 6.5+
+-----------------------------------
+System health diagnostics for the AlphaInsights backend.
 
-This script checks:
-- Core metadata availability
-- Backend presence
-- Supabase configuration and safe connection
-- Overall system status (ready, degraded, or offline)
+Purpose
+-------
+- Used by FastAPI `/health` endpoint and Streamlit dashboards.
+- Validates Supabase connectivity.
+- Reports backend uptime, version, CPU/memory usage, and latency placeholders.
+- Returns JSON-safe dict ready for serialization.
+
+Future extensions (Phase 7+)
+----------------------------
+✅ Add live Supabase latency probes.
+✅ Add API uptime metrics (via Prometheus or psutil).
+✅ Add GPU metrics if using analytics acceleration.
 """
 
 from __future__ import annotations
-import importlib.util
-import json
+
 import os
-import sys
-from datetime import datetime, UTC
+import time
+import platform
+import psutil
+from typing import Dict, Any
 
-# --- Ensure root path for imports ---
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from core.metadata import get_metadata
 from supabase_client.config import get_supabase_client
-from core.safe_connect import test_connection as safe_connect_status
 
 
-def check_backend_available() -> bool:
-    """Check if backend module is importable."""
-    return importlib.util.find_spec("backend.main") is not None
+# Cache the process start time for uptime calculation
+START_TIME = time.time()
 
 
-def system_health() -> dict:
-    """Aggregate all component health signals."""
-    supabase_cfg = get_supabase_config()
-    supabase_safe = safe_connect_status()
+def system_health() -> Dict[str, Any]:
+    """
+    Return structured backend health diagnostics.
 
-    status = {
-        "timestamp": datetime.now(UTC).isoformat(),
-        "core_metadata": bool(get_metadata()),
-        "backend_available": check_backend_available(),
-        "supabase_configured": supabase_cfg.get("configured", False),
-        "supabase_connected": supabase_safe.get("connected", False),
-        "phase": "5.2 (core-cloud integrated)",
-        "status": "ok",
+    Returns
+    -------
+    dict
+        JSON-safe health report compatible with frontend HealthSchema.
+    """
+    status = "ok"
+    message = "Backend operational."
+    supabase_connected = False
+    supabase_url = None
+
+    # --- Supabase connectivity test ---
+    try:
+        sb = get_supabase_client()
+        supabase_url = sb.supabase_url
+        # Ping: list a small number of entries to confirm access
+        sb.table("optimizer_logs").select("id").limit(1).execute()
+        supabase_connected = True
+    except Exception as e:
+        status = "degraded"
+        message = f"Supabase check failed: {e.__class__.__name__}"
+        supabase_connected = False
+
+    # --- System metrics ---
+    try:
+        cpu_load = psutil.cpu_percent(interval=0.2)
+        memory_usage = round(psutil.virtual_memory().used / (1024 * 1024), 2)
+    except Exception:
+        cpu_load = None
+        memory_usage = None
+
+    # --- Construct report ---
+    uptime_sec = round(time.time() - START_TIME, 2)
+    version = os.getenv("BACKEND_VERSION", "1.2")
+
+    health_report = {
+        "status": status,
+        "message": message,
+        "version": version,
+        "supabase_connected": supabase_connected,
+        "supabase_url": supabase_url,
+        "cpu_load": cpu_load,
+        "memory_usage": memory_usage,
+        "uptime_sec": uptime_sec,
+        "system": platform.system(),
+        "release": platform.release(),
     }
 
-    # Adjust overall status dynamically
-    if not status["backend_available"]:
-        status["status"] = "degraded"
-    if not status["core_metadata"]:
-        status["status"] = "critical"
-    if not status["supabase_configured"]:
-        status["status"] = "limited"
-
-    # Merge diagnostic info
-    status["cloud_detail"] = {
-        "detected": supabase_safe.get("supabase_detected"),
-        "credentials_present": supabase_safe.get("credentials_present"),
-        "error": supabase_safe.get("error"),
-    }
-
-    return status
-
-
-if __name__ == "__main__":
-    print(json.dumps(system_health(), indent=2))
+    return health_report

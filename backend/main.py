@@ -1,55 +1,119 @@
 """
 AlphaInsights Backend API
--------------------------
-FastAPI backend service exposing optimization and health endpoints.
+=========================
 
-Phase 6.0–6.2 Summary
----------------------
-- Provides CVaR and Sharpe optimization endpoints.
-- Uses a shared symbol resolver to normalize human-friendly inputs:
-    e.g. "apple" -> "AAPL", "gold" -> "GC=F", "cac 40" -> "^FCHI".
-- Centralizes data loading with robust fallbacks:
-    • Prefer 'Adj Close', fallback to 'Close'.
-    • Cleans and aligns data across assets.
-    • Drops illiquid / broken series with too little data.
-- Delegates Sharpe optimization core logic to analytics.optimization.optimize_sharpe.
-- Designed to be agent-ready: typed models, stable JSON schemas, deterministic math.
+FastAPI backend service exposing optimization, analytics, logging, and health endpoints.
 
-Phase 6.3 Extension
--------------------
-- Adds optional Supabase logging for optimizer calls (non-fatal, best-effort).
+Phase History & Design Intent
+-----------------------------
+• Phase 6.0–6.2
+    - Core CVaR + Sharpe optimizers.
+    - Shared symbol resolver for human-friendly inputs:
+        e.g. "apple" -> "AAPL", "gold" -> "GC=F", "cac 40" -> "^FCHI".
+    - Robust market data pipeline:
+        * Prefer 'Adj Close', fallback 'Close'.
+        * Cleans and aligns data across tickers.
+        * Drops illiquid / broken series with too little data.
+    - Sharpe optimization delegated to `analytics.optimization.optimize_sharpe`.
+    - Deterministic math, typed models, stable JSON schemas (agent-ready).
+
+• Phase 6.3–6.5
+    - Optional Supabase logging for optimizer calls (non-fatal, best-effort).
+    - Centralized helpers in `supabase_client`.
+    - RLS-compatible insert patterns.
+
+• Phase 6.6–6.8
+    - `/logs/recent` and `/logs/query` endpoints:
+        * Filter by endpoint, date range, pagination.
+        * Designed for UI dashboards (e.g. Optimizer History).
+
+• Phase 6.9+
+    - Modular router hooks (`backend.routes.*`) for log insights & analytics.
+    - Extensible status/telemetry endpoints.
+    - Safe fallbacks if optional components are missing.
+
+This file is intentionally verbose and future-proof. Prefer extending it over
+patching ad-hoc logic elsewhere.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from scipy.optimize import minimize
 
 # --------------------------------------------------------------------------- #
-# Setup: import project modules
+# Path setup: ensure project root on sys.path
 # --------------------------------------------------------------------------- #
 
-# Ensure project root on path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
+# Allows imports like `core.*`, `analytics.*`, `supabase_client.*` when running via uvicorn
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
 from core.health import system_health
 from core.symbol_resolver import resolve_tickers
-from analytics.optimization import optimize_sharpe  # Sharpe optimizer core (Phase 6.0+)
+from analytics.optimization import optimize_sharpe
 
-# Phase 6.3: Supabase logging helper (optional, best-effort)
+# --------------------------------------------------------------------------- #
+# Optional Supabase integration (Phase 6.3+)
+# --------------------------------------------------------------------------- #
+
+SUPABASE_ENABLED = False
+
 try:
-    from supabase_client.helpers import insert_record
-except ImportError:  # keep backend working even if supabase_client is absent
-    insert_record = None  # type: ignore
-    print("[Supabase] helpers not available; logging disabled.")
+    # helpers.py is our single front-door to Supabase usage
+    from supabase_client.helpers import (
+        insert_record,
+        fetch_recent,
+        get_supabase_client,
+        test_connection,
+    )
+
+    SUPABASE_ENABLED = True
+except Exception as e:  # noqa: BLE001 - we want to log ANY import issue
+    insert_record = None          # type: ignore[assignment]
+    fetch_recent = None           # type: ignore[assignment]
+    get_supabase_client = None    # type: ignore[assignment]
+    test_connection = None        # type: ignore[assignment]
+    print(f"[Supabase] ⚠️ helpers unavailable — Supabase features disabled. Reason: {e}")
+
+# Read env (for diagnostics only; helpers will also validate)
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+
+if SUPABASE_ENABLED and (not SUPABASE_URL or not SUPABASE_ANON_KEY):
+    print("[Supabase] ❌ Missing SUPABASE_URL or SUPABASE_ANON_KEY; disabling Supabase logging.")
+    SUPABASE_ENABLED = False
+
+# Connection sanity check (non-fatal)
+if SUPABASE_ENABLED and test_connection is not None:
+    try:
+        test_connection(debug=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[Supabase] ⚠️ Connection test failed; disabling Supabase logging. Reason: {e}")
+        SUPABASE_ENABLED = False
+
+# --------------------------------------------------------------------------- #
+# Optional modular routers (Phase 6.9+)
+# --------------------------------------------------------------------------- #
+
+ROUTERS_AVAILABLE = False
+try:
+    # Example: advanced analytics/insights router (if present)
+    from backend.routes.log_insights import router as log_insights_router  # type: ignore
+
+    ROUTERS_AVAILABLE = True
+except Exception as e:  # noqa: BLE001
+    log_insights_router = None  # type: ignore[assignment]
+    print(f"[Backend] ℹ️ log_insights router not loaded (ok for now): {e}")
 
 # --------------------------------------------------------------------------- #
 # FastAPI App
@@ -57,51 +121,43 @@ except ImportError:  # keep backend working even if supabase_client is absent
 
 app = FastAPI(
     title="AlphaInsights Backend API",
-    version="1.3",
+    version="1.5",
     description=(
-        "FastAPI synchronization layer for CVaR, Sharpe, and future analytics endpoints. "
-        "Uses shared symbol resolution, robust data loading, and optional Supabase logging."
+        "Backend for portfolio optimization, analytics, logging, and health.\n"
+        "- Shared symbol resolver + robust data pipeline.\n"
+        "- Sharpe & CVaR optimizers.\n"
+        "- Optional Supabase logging & query endpoints.\n"
+        "- Modular routers for future analytics."
     ),
 )
 
+if ROUTERS_AVAILABLE and log_insights_router is not None:
+    app.include_router(log_insights_router, prefix="/logs/insights")
+    print("[Backend] ✅ Registered /logs/insights router.")
+
 # --------------------------------------------------------------------------- #
-# Pydantic Models (Agent-Ready)
+# Pydantic Models (Agent & UI Friendly)
 # --------------------------------------------------------------------------- #
 
 class OptimizeRequest(BaseModel):
     """
     Common request model for optimizer endpoints.
-
-    Attributes
-    ----------
-    tickers : List[str]
-        Human or symbol inputs (e.g. 'apple', 'AAPL', 'gold', 'cac 40').
-    start : str
-        Start date (YYYY-MM-DD).
-    end : str
-        End date (YYYY-MM-DD).
-    alpha : float, optional
-        Tail/confidence parameter (used by CVaR; ignored by Sharpe).
-    rf : float, optional
-        Annualized risk-free rate (used by Sharpe).
     """
     tickers: List[str]
-    start: str
-    end: str
-    alpha: Optional[float] = 0.95
-    rf: Optional[float] = 0.0
+    start: str              # YYYY-MM-DD
+    end: str                # YYYY-MM-DD
+    alpha: Optional[float] = 0.95   # Used by CVaR
+    rf: Optional[float] = 0.0       # Used by Sharpe
 
 
 class CVaRResponse(BaseModel):
     """
-    Response schema for CVaR optimizer.
-
-    Matches the stable agent-ready contract.
+    Response schema for CVaR optimizer (stable contract).
     """
     weights: Dict[str, float]
-    es: float
-    var: float
-    ann_vol: float
+    es: float               # Expected Shortfall (CVaR)
+    var: float              # Value-at-Risk
+    ann_vol: float          # Annualized volatility
     solver: str
     success: bool
     summary: str
@@ -109,9 +165,7 @@ class CVaRResponse(BaseModel):
 
 class SharpeResponse(BaseModel):
     """
-    Response schema for Sharpe optimizer.
-
-    Mirrors analytics.optimize_sharpe stable contract.
+    Response schema for Sharpe optimizer (stable contract).
     """
     weights: Dict[str, float]
     sharpe: float
@@ -128,33 +182,23 @@ class SharpeResponse(BaseModel):
 
 def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     """
-    Resolve tickers, download prices, and compute daily log returns.
+    Resolve tickers, download prices via yfinance, and compute daily log returns.
 
-    Robust behavior
-    ---------------
-    1. Uses core.symbol_resolver.resolve_tickers for human-friendly inputs.
-    2. Downloads data via yfinance with:
-         - threads=True for speed
-         - timeout=60s to reduce spurious timeouts
-    3. Prefers 'Adj Close', falls back to 'Close'.
-    4. Drops assets with insufficient observations (illiquid / broken).
-    5. Forward/ backward fills small gaps to align calendars.
-    6. Returns a non-empty 2-D returns matrix or raises a clean HTTP 400.
+    Behavior:
+    --------
+    1. Resolve user inputs via core.symbol_resolver.
+    2. Download OHLCV with multi-asset support.
+    3. Prefer 'Adj Close', fallback 'Close'.
+    4. Drop unusable/empty series.
+    5. Ensure minimum history per asset.
+    6. Align calendar; ffill/bfill small gaps.
+    7. Compute log returns and drop invalid rows.
 
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame of log returns (rows = dates, cols = tickers).
-
-    Raises
-    ------
-    HTTPException(400)
-        If resolution or data loading fails in a user-relevant way.
+    Raises HTTPException(400) for user-facing errors.
     """
-    # 1) Resolve free-form labels to concrete symbols
+    # 1) Symbol resolution
     resolved, messages = resolve_tickers(tickers)
     for msg in messages:
-        # Logged to backend console for traceability; UI can display its own hints.
         print(f"[resolver] {msg}")
 
     if not resolved:
@@ -163,7 +207,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             detail=f"No valid symbols could be resolved from inputs: {tickers}",
         )
 
-    # 2) Download OHLCV data for resolved symbols
+    # 2) Historical data download
     try:
         data = yf.download(
             resolved,
@@ -172,9 +216,9 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             progress=False,
             auto_adjust=False,
             threads=True,
-            timeout=60,  # avoid unnecessary timeouts on multi-asset queries
+            timeout=60,
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=400,
             detail=f"Data download failed from yfinance: {e}",
@@ -186,7 +230,7 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
             detail=f"No data returned for tickers: {resolved}",
         )
 
-    # 3) Extract price matrix (Adj Close preferred, fallback Close)
+    # 3) Price extraction
     if "Adj Close" in data:
         prices = data["Adj Close"]
     elif "Close" in data:
@@ -194,25 +238,25 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
     else:
         raise HTTPException(
             status_code=400,
-            detail="No 'Adj Close' or 'Close' data available from yfinance.",
+            detail="No 'Adj Close' or 'Close' columns available from yfinance.",
         )
 
     if isinstance(prices, pd.Series):
         prices = prices.to_frame()
 
-    # Normalize column labels if MultiIndex
+    # Normalize MultiIndex columns
     if isinstance(prices.columns, pd.MultiIndex):
         prices.columns = [str(c[-1]) for c in prices.columns]
 
-    # 4) Drop totally empty columns
+    # 4) Drop fully empty columns
     prices = prices.dropna(how="all", axis=1)
     if prices.empty:
         raise HTTPException(
             status_code=400,
-            detail=f"No valid price data for tickers after initial cleanup: {resolved}",
+            detail=f"No valid price data after initial cleanup for: {resolved}",
         )
 
-    # 5) Keep only assets with sufficient observations (e.g. >= 30 points)
+    # 5) Liquidity / history filter
     valid_cols = [c for c in prices.columns if prices[c].notna().sum() >= 30]
     if not valid_cols:
         raise HTTPException(
@@ -221,39 +265,36 @@ def _fetch_data(tickers: List[str], start: str, end: str) -> pd.DataFrame:
         )
     prices = prices[valid_cols]
 
-    # 6) Align calendars: sort, forward-fill, back-fill
+    # 6) Calendar alignment
     prices = prices.sort_index()
     prices = prices.ffill().bfill()
-
-    # Ensure something remains
     prices = prices.dropna(how="all", axis=0)
     if prices.empty or prices.shape[1] == 0:
         raise HTTPException(
             status_code=400,
-            detail="Price alignment resulted in empty series.",
+            detail="Price alignment resulted in an empty price matrix.",
         )
 
-    # 7) Compute log returns; drop rows where all returns are NaN
+    # 7) Log returns
     returns = np.log(prices / prices.shift(1))
     returns = returns.replace([np.inf, -np.inf], np.nan)
     returns = returns.dropna(how="all", axis=0)
-
     if returns.empty or returns.shape[1] == 0:
         raise HTTPException(
             status_code=400,
-            detail="No valid returns could be computed after alignment and cleaning.",
+            detail="No valid returns could be computed after cleaning.",
         )
 
     return returns
 
 
 # --------------------------------------------------------------------------- #
-# Legacy CVaR Optimizer (Local SLSQP Implementation)
+# CVaR Optimizer (Local SLSQP Implementation)
 # --------------------------------------------------------------------------- #
 
 def _compute_cvar(returns_array: np.ndarray, weights: np.ndarray, alpha: float) -> float:
     """
-    Compute portfolio CVaR (Expected Shortfall) given returns matrix and weights.
+    Compute portfolio CVaR (Expected Shortfall) for given weights.
     """
     portfolio_returns = returns_array @ weights
     cutoff = np.quantile(portfolio_returns, 1 - alpha)
@@ -271,13 +312,13 @@ def _objective(weights: np.ndarray, returns_array: np.ndarray, alpha: float) -> 
 def _optimize_cvar(
     returns: pd.DataFrame,
     alpha: float,
-) -> tuple[Dict[str, float], float, float, float, str, bool]:
+) -> Tuple[Dict[str, float], float, float, float, str, bool]:
     """
     Simple CVaR optimizer using SLSQP (long-only, fully invested).
 
     Returns
     -------
-    (weights_dict, es, var, ann_vol, solver_name, success)
+    weights_dict, es, var, ann_vol, solver_name, success
     """
     R = returns.values
     n = R.shape[1]
@@ -316,8 +357,8 @@ def _optimize_cvar(
             True,
         )
 
-    except Exception:
-        # Fallback: equal-weight portfolio over available assets
+    except Exception:  # noqa: BLE001
+        # Fallback: equal-weight across available assets
         weights = np.ones(n, dtype=float) / float(n)
         portfolio = R @ weights
         es = _compute_cvar(R, weights, alpha)
@@ -335,25 +376,59 @@ def _optimize_cvar(
 
 
 # --------------------------------------------------------------------------- #
-# Routes
+# Internal: Supabase logging helper (centralized)
+# --------------------------------------------------------------------------- #
+
+def _log_to_supabase(payload: Dict[str, Any]) -> None:
+    """
+    Centralized, best-effort Supabase logging.
+
+    - No exceptions bubble up to the API layer.
+    - Only runs if SUPABASE_ENABLED and insert_record is available.
+    - Safe to call from any endpoint.
+    """
+    if not SUPABASE_ENABLED or insert_record is None:
+        return
+
+    try:
+        table = "optimizer_logs"
+        print(f"[Supabase] → Inserting into '{table}' …")
+        print(f"[Supabase] Payload keys: {list(payload.keys())}")
+        res = insert_record(table, payload, debug=True)  # type: ignore[arg-type]
+        if res:
+            print(f"[Supabase] ✅ Insert success → {res}")
+        else:
+            print("[Supabase] ⚠️ Insert returned no data (check RLS / schema).")
+    except Exception as e:  # noqa: BLE001
+        print(f"[Supabase] ⚠️ Insert failed: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Core Routes
 # --------------------------------------------------------------------------- #
 
 @app.get("/")
 async def root():
     """
-    Basic liveness probe for backend.
+    Basic liveness probe.
     """
     return {
         "status": "ok",
-        "message": "AlphaInsights Backend API is running.",
+        "message": "AlphaInsights Backend is live.",
         "version": app.version,
+        "supabase_enabled": SUPABASE_ENABLED,
     }
 
 
 @app.get("/health")
 async def health():
     """
-    Expose system health diagnostics from core.health.system_health.
+    System health endpoint.
+
+    Delegates to core.health.system_health which:
+    - Checks Python/runtime info
+    - Optionally checks Supabase connectivity (via supabase_client)
+    - Returns a stable, machine-readable payload
     """
     return system_health()
 
@@ -361,15 +436,14 @@ async def health():
 @app.post("/optimize/cvar", response_model=CVaRResponse)
 async def optimize_cvar_endpoint(request: OptimizeRequest):
     """
-    CVaR optimizer endpoint.
+    CVaR optimizer endpoint (Phase 6.x).
 
-    - Resolves tickers via shared resolver.
-    - Loads and cleans return series.
-    - Runs local SLSQP-based CVaR optimizer.
-    - Logs request/response to Supabase (if configured).
+    - Uses shared data loader.
+    - Runs SLSQP-based CVaR optimizer.
+    - Best-effort logging to Supabase (if enabled).
     """
     try:
-        alpha = request.alpha if request.alpha is not None else 0.95
+        alpha = float(request.alpha if request.alpha is not None else 0.95)
         returns = _fetch_data(request.tickers, request.start, request.end)
 
         weights, es, var, ann_vol, solver, success = _optimize_cvar(returns, alpha)
@@ -380,7 +454,7 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
             f"ES={es:.4f}, VaR={var:.4f}, σₐ={ann_vol:.4f}."
         )
 
-        result = {
+        result: Dict[str, Any] = {
             "weights": weights,
             "es": es,
             "var": var,
@@ -390,104 +464,182 @@ async def optimize_cvar_endpoint(request: OptimizeRequest):
             "summary": summary,
         }
 
-        # Optional Supabase logging
-        if insert_record is not None:
-            try:
-                insert_record(
-                    "optimizer_logs",
-                    {
-                        "endpoint": "cvar",
-                        "tickers": request.tickers,
-                        "start": request.start,
-                        "end": request.end,
-                        "alpha": request.alpha,
-                        "result": result,
-                    },
-                )
-            except Exception as log_err:
-                print(f"[Supabase] ⚠️ Logging failed (CVaR): {log_err}")
+        _log_to_supabase(
+            {
+                "endpoint": "cvar",
+                "tickers": request.tickers,
+                "start": request.start,
+                "end": request.end,
+                "alpha": alpha,
+                "rf": None,
+                "result": result,
+            }
+        )
 
         return result
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/optimize/sharpe", response_model=SharpeResponse)
 async def optimize_sharpe_endpoint(request: OptimizeRequest):
     """
-    Sharpe optimizer endpoint (Phase 6.0–6.3).
+    Sharpe optimizer endpoint (Phase 6.x).
 
-    - Resolves tickers via shared resolver.
-    - Loads and cleans log returns.
+    - Uses shared data loader.
     - Delegates to analytics.optimization.optimize_sharpe.
-    - Returns stable, agent-friendly schema.
-    - Logs request/response to Supabase (if configured).
+    - Best-effort Supabase logging.
     """
     try:
         returns = _fetch_data(request.tickers, request.start, request.end)
         if returns.empty:
             raise ValueError("No valid return data for requested tickers/date range.")
 
-        rf = float(request.rf) if request.rf is not None else 0.0
+        rf = float(request.rf if request.rf is not None else 0.0)
 
-        # Call analytics.optimize_sharpe with explicit risk_free_rate keyword
         result = optimize_sharpe(returns, risk_free_rate=rf)
 
-        # Optional Supabase logging
-        if insert_record is not None:
-            try:
-                insert_record(
-                    "optimizer_logs",
-                    {
-                        "endpoint": "sharpe",
-                        "tickers": request.tickers,
-                        "start": request.start,
-                        "end": request.end,
-                        "rf": request.rf,
-                        "result": result,
-                    },
-                )
-            except Exception as log_err:
-                print(f"[Supabase] ⚠️ Logging failed (Sharpe): {log_err}")
+        _log_to_supabase(
+            {
+                "endpoint": "sharpe",
+                "tickers": request.tickers,
+                "start": request.start,
+                "end": request.end,
+                "alpha": None,
+                "rf": rf,
+                "result": result,
+            }
+        )
 
         return result
 
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(
             status_code=400,
             detail=f"Sharpe optimization failed: {e}",
         )
 
+
 # --------------------------------------------------------------------------- #
-# Supabase Log Retrieval Endpoint (Phase 6.3F)
+# Supabase Log Retrieval Endpoints (for UI & Agents)
 # --------------------------------------------------------------------------- #
 
 @app.get("/logs/recent")
 async def get_recent_logs(limit: int = 10):
     """
-    Retrieve the most recent optimizer logs from Supabase.
+    Return the most recent optimizer logs.
 
-    Parameters
-    ----------
-    limit : int
-        Number of records to fetch (default = 10).
-
-    Returns
-    -------
-    list[dict]
-        Recent log entries sorted by created_at (descending).
+    - Backed by Supabase `optimizer_logs` table.
+    - Used by simple history views / debugging tools.
     """
+    if not SUPABASE_ENABLED or fetch_recent is None:
+        raise HTTPException(status_code=503, detail="Supabase logging is disabled.")
+
     try:
-        from supabase_client.helpers import fetch_recent
-        logs = fetch_recent("optimizer_logs", limit=limit, debug=True)
+        logs = fetch_recent("optimizer_logs", limit=limit, debug=True)  # type: ignore[arg-type]
         return logs
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to fetch logs: {e}")
+
+
+@app.get("/logs/query")
+async def query_logs(
+    endpoint: Optional[str] = Query(
+        None, description="Filter by endpoint name, e.g. 'sharpe' or 'cvar'"
+    ),
+    start: Optional[str] = Query(
+        None, description="Filter created_at >= this ISO timestamp/date"
+    ),
+    end: Optional[str] = Query(
+        None, description="Filter created_at <= this ISO timestamp/date"
+    ),
+    limit: int = Query(
+        20, ge=1, le=200, description="Number of rows to return (1–200)"
+    ),
+    offset: int = Query(
+        0, ge=0, description="Offset for pagination (0 = first page)"
+    ),
+):
+    """
+    Advanced log query endpoint (Phase 6.6+).
+
+    - Supports endpoint filter, date range, pagination.
+    - Returns:
+        * count       : rows in this page
+        * total       : total matching rows (exact count)
+        * last_updated: most recent created_at in this page
+        * results     : list of log records
+    """
+    if not SUPABASE_ENABLED or get_supabase_client is None:
+        raise HTTPException(status_code=503, detail="Supabase logging is disabled.")
+
+    try:
+        sb = get_supabase_client()
+        query = sb.table("optimizer_logs").select("*")
+
+        if endpoint:
+            query = query.eq("endpoint", endpoint)
+        if start:
+            query = query.gte("created_at", start)
+        if end:
+            query = query.lte("created_at", end)
+
+        # Range is inclusive, so use offset..offset+limit-1
+        query = query.order("created_at", desc=True).range(
+            offset, offset + limit - 1
+        )
+        res = query.execute()
+        data = res.data or []
+
+        # Exact count for pagination
+        total_res = (
+            sb.table("optimizer_logs")
+            .select("id", count="exact")
+            .execute()
+        )
+        total_count = getattr(total_res, "count", None) or len(data)
+
+        last_updated = data[0]["created_at"] if data else None
+
+        return {
+            "count": len(data),
+            "total": int(total_count),
+            "last_updated": last_updated,
+            "results": data,
+        }
+
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Failed to query logs: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# Status / Future Analytics Placeholder (Phase 7.0+)
+# --------------------------------------------------------------------------- #
+
+@app.get("/status/summary")
+async def status_summary():
+    """
+    High-level status summary for dashboards & agents.
+
+    Future extension:
+    - Aggregate optimizer usage stats.
+    - Expose rolling success rates for optimizers.
+    - Surface Supabase latency / error rates.
+    """
+    return {
+        "backend_version": app.version,
+        "supabase_enabled": bool(SUPABASE_ENABLED),
+        "supabase_url_configured": bool(SUPABASE_URL),
+        "routers": {
+            "log_insights_registered": bool(ROUTERS_AVAILABLE),
+        },
+    }
+
 
 # --------------------------------------------------------------------------- #
 # End of File
