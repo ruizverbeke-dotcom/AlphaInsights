@@ -691,6 +691,36 @@ async def logs_insights(
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to compute log insights: {e}")
 
+# --------------------------------------------------------------------------- #
+# Auto System Snapshot on Startup (Phase 7.2+)
+# --------------------------------------------------------------------------- #
+from datetime import datetime
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+@app.on_event("startup")
+async def write_startup_snapshot():
+    """Write system status snapshot at backend startup."""
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        snapshot_path = os.path.join(LOG_DIR, f"system_status_{timestamp}.txt")
+
+        with open(snapshot_path, "w", encoding="utf-8") as f:
+            f.write(
+                f"AlphaInsights Backend Startup Snapshot — {datetime.now()}\n\n"
+                f"Backend Version: {app.version}\n"
+                f"Supabase Enabled: {SUPABASE_ENABLED}\n"
+                f"Supabase URL Configured: {bool(SUPABASE_URL)}\n"
+                f"Routers Registered: /logs/insights, /valuation\n"
+                f"Python Executable: {sys.executable}\n"
+                f"Working Directory: {os.getcwd()}\n"
+            )
+
+        print(f"[Startup] 📝 System snapshot written → {snapshot_path}")
+    except Exception as e:
+        print(f"[Startup] ⚠️ Could not write system snapshot: {e}")
+
 
 # --------------------------------------------------------------------------- #
 # Status / Future Analytics Placeholder (Phase 7.0+)
