@@ -1,43 +1,10 @@
-# ===============================================================
-# Sharpe Ratio Dashboard — AlphaInsights UI
-# ===============================================================
-# Phase 6.0 — Backend-Integrated Sharpe Optimizer (Preserved UX)
-#
-# Author: Ruïz Verbeke
-#
-# What this page does
-# -------------------
-# - Preserves the mature Sharpe analysis flow:
-#     • Active Profile banner with persistence
-#     • Robust ticker resolution helpers
-#     • Optional custom weights
-#     • Benchmark comparison
-#     • Cumulative chart, histogram, rolling Sharpe
-# - Integrates the FastAPI /optimize/sharpe endpoint:
-#     • If no custom weights are provided:
-#           → use backend optimizer weights (Sharpe_SLSQP)
-#     • If custom weights are provided:
-#           → use them directly (no backend override)
-# - Adds robust data validation:
-#     • Drops tickers with insufficient data
-#     • Realigns weights to surviving tickers
-#     • Prevents "Analysis Complete" with NaN metrics
-#
-# Design Principles
-# -----------------
-# - No heavy optimization logic here (delegated to backend & analytics).
-# - Enforces 1-D safety for all series.
-# - Fails gracefully with clear messages, no raw tracebacks for users.
-# - Ready for agents: inputs/outputs are clear and JSON-friendly.
-# ===============================================================
-
 from __future__ import annotations
 
 import os
 import sys
 import math
 from functools import lru_cache
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -47,21 +14,33 @@ import plotly.express as px
 import matplotlib.pyplot as plt  # kept for potential future use
 import yfinance as yf
 
-# --- Ensure the project root is in Python's import path ---
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
-if project_root not in sys.path:
-    sys.path.append(project_root)
+# =============================================================================
+# Path & Imports Bootstrapping
+# =============================================================================
+# Ensure proper import resolution when running:
+#   streamlit run ui/overview.py
+# or:
+#   streamlit run ui/pages/sharpe_dashboard.py
+# -----------------------------------------------------------------------------
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
 from analytics.sharpe_ratio import calculate_sharpe_ratio
 from database.queries import get_profile, get_profiles
 from core.symbol_resolver import resolve_symbol
+from core.ui_helpers import fetch_backend
+from core.ui_config import BACKEND_URL as CONFIG_BACKEND_URL
 
-# ===============================================================
+# =============================================================================
 # Global Config
-# ===============================================================
-
-DEFAULT_BACKEND_URL = os.getenv("ALPHAINSIGHTS_BACKEND_URL", "http://127.0.0.1:8000")
+# =============================================================================
+# Single source of truth for backend base URL.
+# If you ever centralize this differently, update ui_config and we stay in sync.
+DEFAULT_BACKEND_URL: str = CONFIG_BACKEND_URL or os.getenv(
+    "ALPHAINSIGHTS_BACKEND_URL",
+    "http://127.0.0.1:8000",
+)
 
 st.set_page_config(
     page_title="Sharpe Ratio Analysis — AlphaInsights",
@@ -69,9 +48,9 @@ st.set_page_config(
     layout="wide",
 )
 
-# ===============================================================
+# =============================================================================
 # 1-D Safety Helper
-# ===============================================================
+# =============================================================================
 
 def ensure_1d(series_like: pd.Series | pd.DataFrame) -> pd.Series:
     """
@@ -81,21 +60,23 @@ def ensure_1d(series_like: pd.Series | pd.DataFrame) -> pd.Series:
       - squeeze() to collapse (N,1)
       - np.ravel() to guarantee flat array
     """
-    s = series_like.squeeze("columns") if isinstance(series_like, pd.DataFrame) else series_like
-    s = pd.Series(
-        np.ravel(s),
-        index=getattr(s, "index", None)[: len(np.ravel(s))]
-        if getattr(s, "index", None) is not None
-        else None,
-    )
-    return s
+    if isinstance(series_like, pd.DataFrame):
+        s = series_like.squeeze("columns")
+    else:
+        s = series_like
+
+    arr = np.ravel(s)
+    idx = getattr(s, "index", None)
+    if idx is not None:
+        idx = idx[: len(arr)]
+    return pd.Series(arr, index=idx)
 
 
-# ===============================================================
-# Ticker Resolution Helpers (Preserved Logic)
-# ===============================================================
+# =============================================================================
+# Ticker Resolution Helpers (Preserved + Hardened)
+# =============================================================================
 
-_INDEX_MAP = {
+_INDEX_MAP: Dict[str, str] = {
     "CAC 40": "^FCHI",
     "CAC40": "^FCHI",
     "SP500": "^GSPC",
@@ -117,8 +98,7 @@ def normalize_ticker(name: str) -> str:
     """
     Map common index names to canonical tickers; otherwise uppercase.
 
-    This is a deterministic, lightweight mapping layer.
-    A richer semantic resolver can plug in later without changing callers.
+    Deterministic, dependency-free mapping.
     """
     raw = (name or "").strip()
     if not raw:
@@ -131,27 +111,26 @@ def normalize_ticker(name: str) -> str:
 
 
 @lru_cache(maxsize=256)
-def yahoo_search_symbol(query: str) -> str | None:
+def yahoo_search_symbol(query: str) -> Optional[str]:
     """
     Resolve a free-form query (company/index name) to a Yahoo Finance symbol.
 
-    This is a pragmatic helper, not a magic AI resolver.
-    It:
-      - fast-paths plausible tickers,
-      - queries Yahoo search,
-      - picks the most reasonable candidate.
+    Design:
+      - Short ticker-like strings: returned as-is (uppercased).
+      - Uses Yahoo search endpoint directly (NOT the backend).
+      - Picks the most plausible candidate using a tiny scoring heuristic.
     """
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    # Already looks like a ticker → let later validation handle it.
+    if len(q) <= 6 and all(ch.isalnum() or ch in ".^-" for ch in q):
+        return q.upper()
+
     try:
-        q = (query or "").strip()
-        if not q:
-            return None
-
-        # If it already looks like a ticker, let data validation handle it later.
-        if len(q) <= 6 and all(ch.isalnum() or ch in ".^-" for ch in q):
-            return q.upper()
-
         url = "https://query1.finance.yahoo.com/v1/finance/search"
-        resp = fetch_backend(url, params={"q": q}, timeout=6)
+        resp = requests.get(url, params={"q": q}, timeout=6)
         if resp.status_code != 200:
             return None
 
@@ -162,6 +141,7 @@ def yahoo_search_symbol(query: str) -> str | None:
 
         best = None
         best_score = -1.0
+
         for item in quotes:
             sym = item.get("symbol")
             if not sym:
@@ -186,15 +166,15 @@ def resolve_tickers(user_inputs: List[str]) -> Tuple[List[str], List[str]]:
     """
     Resolve user-provided labels into candidate tickers.
 
-    Steps:
+    Pipeline:
       1) Normalize known index names.
-      2) Try Yahoo Finance search for others.
+      2) Use symbol_resolver + Yahoo Finance search for others.
       3) Deduplicate while preserving order.
 
     Returns:
-        resolved_symbols, messages (for transparency)
+        resolved_symbols, messages (for transparency in UI)
     """
-    seen = set()
+    seen: set[str] = set()
     resolved: List[str] = []
     messages: List[str] = []
 
@@ -207,9 +187,7 @@ def resolve_tickers(user_inputs: List[str]) -> Tuple[List[str], List[str]]:
         candidate = norm
 
         if norm == raw.upper():
-            # Phase 6.2: enhanced resolver (static + fuzzy)
             suggestion = resolve_symbol(raw) or yahoo_search_symbol(raw)
-
             if suggestion and suggestion != raw.upper():
                 messages.append(f"ℹ️ '{raw}' interpreted as '{suggestion}'.")
                 candidate = suggestion
@@ -228,30 +206,28 @@ def validate_tickers(symbols: List[str]) -> Tuple[List[str], List[str]]:
     """
     Light validation using yfinance metadata.
 
-    We keep this permissive; hard filtering is applied after downloading prices.
-    Returns:
-        valid_symbols, warnings
+    Intentionally permissive:
+      - We keep borderline tickers; final filter is price history.
     """
     valid: List[str] = []
     warnings: List[str] = []
+
     for t in symbols:
         try:
-            info = yf.Ticker(t).info
-            # Even if thin, we keep it; real check is price history.
-            if info and "regularMarketPrice" in info:
-                valid.append(t)
-            else:
-                valid.append(t)
-        except Exception:
+            _ = yf.Ticker(t).info  # Probe; failure is soft.
             valid.append(t)
+        except Exception:
+            # Keep anyway; history check will decide.
+            valid.append(t)
+
     return valid, warnings
 
 
-# ===============================================================
+# =============================================================================
 # Weight Parsing Helper
-# ===============================================================
+# =============================================================================
 
-def safe_weights_or_none(weights_text: str, n_assets: int) -> np.ndarray | None:
+def safe_weights_or_none(weights_text: str, n_assets: int) -> Optional[np.ndarray]:
     """
     Parse and validate user-provided weights.
 
@@ -263,23 +239,23 @@ def safe_weights_or_none(weights_text: str, n_assets: int) -> np.ndarray | None:
         return None
 
     try:
-        w = np.array(
-            [float(x.strip()) for x in weights_text.split(",")],
-            dtype=float,
-        )
+        w = np.array([float(x.strip()) for x in weights_text.split(",")], dtype=float)
     except Exception:
         st.error("❌ Weights must be numbers separated by commas.")
         return None
 
     if len(w) != n_assets:
-        st.warning(f"⚠️ Provided {len(w)} weights for {n_assets} tickers. Falling back to backend/equal-weight.")
+        st.warning(
+            f"⚠️ Provided {len(w)} weights for {n_assets} tickers. "
+            f"Falling back to backend/equal-weight."
+        )
         return None
 
     if np.any(np.isnan(w)) or np.any(w < 0):
         st.warning("⚠️ Weights contain NaN/negative values. Falling back to backend/equal-weight.")
         return None
 
-    s = w.sum()
+    s = float(w.sum())
     if s <= 0:
         st.warning("⚠️ Weights sum to 0. Falling back to backend/equal-weight.")
         return None
@@ -287,25 +263,48 @@ def safe_weights_or_none(weights_text: str, n_assets: int) -> np.ndarray | None:
     return w / s
 
 
-# ===============================================================
+# =============================================================================
 # Backend Integration Helpers
-# ===============================================================
+# =============================================================================
 
-def render_backend_health(backend_url: str) -> None:
+def render_backend_health(user_backend_url: str) -> None:
     """
-    Display backend health in the sidebar using /health.
+    Display backend health in the sidebar.
 
-    Never blocks the UI; purely informational.
+    Behavior:
+      - If user overrides the URL in the sidebar → call that directly.
+      - Otherwise → use unified fetch_backend("health") which is wired to BACKEND_URL.
+    This keeps us forward compatible with the central fetch logic.
     """
-    url = backend_url.rstrip("/") + "/health"
+    # Normalize override
+    override = (user_backend_url or "").strip()
+    use_override = override and override != DEFAULT_BACKEND_URL
+
     try:
-        resp = fetch_backend(url, timeout=3)
-        if resp.status_code == 200:
-            st.sidebar.success("Backend: Online")
+        if use_override:
+            # Direct call against custom URL
+            url = override.rstrip("/") + "/health"
+            resp = requests.get(url, timeout=3)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {}
+            else:
+                data = {}
         else:
-            st.sidebar.warning(f"Backend issue (status {resp.status_code})")
-    except Exception:
-        st.sidebar.error("Backend: Unreachable")
+            # Unified layer (preferred)
+            data = fetch_backend("health")
+
+        if isinstance(data, dict) and data.get("status") == "ok":
+            st.sidebar.success("Backend: Online")
+        elif isinstance(data, dict) and data:
+            st.sidebar.warning("Backend reachable, but health check not OK.")
+            st.sidebar.json(data)
+        else:
+            st.sidebar.error("Backend: Unreachable or invalid health response.")
+    except Exception as e:
+        st.sidebar.error(f"Backend: Unreachable ({e})")
 
 
 def call_backend_sharpe(
@@ -318,15 +317,19 @@ def call_backend_sharpe(
     """
     Call /optimize/sharpe on the backend to obtain optimized weights & metrics.
 
-    If it fails, returns {} and the caller gracefully falls back.
+    We intentionally keep this as a direct POST (not via fetch_backend)
+    to avoid coupling to helper signatures and to preserve existing API expectations.
     """
-    url = backend_url.rstrip("/") + "/optimize/sharpe"
+    base = (backend_url or DEFAULT_BACKEND_URL).rstrip("/")
+    url = f"{base}/optimize/sharpe"
+
     payload = {
         "tickers": tickers,
         "start": start,
         "end": end,
         "rf": rf,
-        "alpha": 0.95,  # required by shared OptimizeRequest; ignored by Sharpe logic
+        # Shared OptimizeRequest may require alpha; ignored by Sharpe logic.
+        "alpha": 0.95,
     }
 
     try:
@@ -352,11 +355,12 @@ def call_backend_sharpe(
     return data or {}
 
 
-# ===============================================================
+# =============================================================================
 # Header & Active Profile Banner
-# ===============================================================
+# =============================================================================
 
 st.title("📊 Sharpe Ratio Analysis & Optimization Dashboard")
+
 st.write(
     "Analyze Sharpe Ratios for assets or custom portfolios, compare against a benchmark, "
     "and (optionally) use the backend optimizer to propose Sharpe-maximizing weights."
@@ -381,10 +385,10 @@ if not active_id:
 if active_id:
     profile = get_profile(active_id)
     if profile:
-        constraints = getattr(profile, "constraints", {}) or {}
+        constraints = getattr(profile, "constraints", {}) or {}  # type: ignore[attr-defined]
         region = constraints.get("preferred_region", "—")
         st.success(
-            f"**{profile.name or 'Unnamed Profile'}**  |  "
+            f"**{getattr(profile, 'name', 'Unnamed Profile')}**  |  "
             f"Risk Score: {getattr(profile, 'risk_score', '—')}/10  |  "
             f"Region: {region}"
         )
@@ -395,20 +399,25 @@ else:
 
 st.divider()
 
-# ===============================================================
+
+# =============================================================================
 # Sidebar Controls
-# ===============================================================
+# =============================================================================
 
 with st.sidebar:
     st.header("⚙️ Analysis & Optimization Settings")
 
-    backend_url = st.text_input(
-        "Backend URL",
+    backend_url_input = st.text_input(
+        "Backend URL (override, optional)",
         value=DEFAULT_BACKEND_URL,
-        help="FastAPI backend base URL (default: http://127.0.0.1:8000)",
+        help=(
+            "FastAPI backend base URL. "
+            "If left as default, calls go through the standard AlphaInsights config."
+        ),
     )
 
-    render_backend_health(backend_url)
+    # Health summary (uses override if changed)
+    render_backend_health(backend_url_input)
 
     tickers_input = st.text_input(
         "Enter tickers (comma-separated):",
@@ -441,15 +450,16 @@ with st.sidebar:
 
     run_analysis = st.button("🚀 Run Analysis", type="primary")
 
-# ===============================================================
+
+# =============================================================================
 # Main Logic
-# ===============================================================
+# =============================================================================
 
 if run_analysis:
     try:
-        # -----------------------------
+        # ---------------------------------------------------------------------
         # 1. Resolve & validate tickers
-        # -----------------------------
+        # ---------------------------------------------------------------------
         user_inputs = [t for t in (x.strip() for x in tickers_input.split(",")) if t]
         resolved, info_msgs = resolve_tickers(user_inputs)
         for m in info_msgs:
@@ -470,13 +480,12 @@ if run_analysis:
             )
             st.stop()
 
-        # -----------------------------
-        # 2. Decide weights source
-        # -----------------------------
+        # ---------------------------------------------------------------------
+        # 2. Decide weights source (manual vs backend vs equal-weight)
+        # ---------------------------------------------------------------------
         backend_used = False
         backend_data: Dict[str, Any] = {}
 
-        # Try to parse user-provided weights (if any)
         w_vec = safe_weights_or_none(weights_text, len(valid_tickers))
 
         if w_vec is None:
@@ -486,7 +495,7 @@ if run_analysis:
 
             with st.spinner("Calling backend Sharpe optimizer for weights..."):
                 backend_data = call_backend_sharpe(
-                    backend_url=backend_url,
+                    backend_url=backend_url_input,
                     tickers=valid_tickers,
                     start=start_str,
                     end=end_str,
@@ -496,31 +505,26 @@ if run_analysis:
             if backend_data.get("weights"):
                 backend_used = True
                 weights_from_backend = backend_data["weights"]
-                # Align to valid_tickers order
-                w_vec = np.array(
+                w_raw = np.array(
                     [float(weights_from_backend.get(t, 0.0)) for t in valid_tickers],
                     dtype=float,
                 )
-                s = float(w_vec.sum())
+                s = float(w_raw.sum())
                 if s > 0:
-                    w_vec = w_vec / s
+                    w_vec = w_raw / s
                 else:
-                    w_vec = np.ones(len(valid_tickers)) / len(valid_tickers)
+                    w_vec = np.ones(len(valid_tickers), dtype=float) / float(len(valid_tickers))
             else:
-                # Backend not available/failed → equal-weight fallback
                 st.warning(
                     "Backend Sharpe optimizer unavailable or returned no weights. "
                     "Falling back to equal-weight portfolio."
                 )
-                w_vec = np.ones(len(valid_tickers)) / len(valid_tickers)
-        else:
-            # Valid manual weights provided → respect them (no backend override)
-            start_str = str(start_date)
-            end_str = str(end_date)
+                w_vec = np.ones(len(valid_tickers), dtype=float) / float(len(valid_tickers))
+        # else: valid manual weights already chosen and respected.
 
-        # -----------------------------
+        # ---------------------------------------------------------------------
         # 3. Download & clean price data
-        # -----------------------------
+        # ---------------------------------------------------------------------
         data = yf.download(
             tickers=valid_tickers,
             start=str(start_date),
@@ -538,7 +542,7 @@ if run_analysis:
                 prices = data.copy()
             prices.columns = [valid_tickers[0]]
         else:
-            cols = {}
+            cols: Dict[str, pd.Series] = {}
             for t in valid_tickers:
                 try:
                     if t in data and "Close" in data[t]:
@@ -562,8 +566,7 @@ if run_analysis:
             st.error("❌ Could not compute daily returns (empty after pct_change).")
             st.stop()
 
-        # --- Data Validation & Auto-Clean Step (Long-Term Stable Pattern) ---
-        # Keep only columns with sufficient non-NaN points
+        # Keep columns with sufficient observations
         valid_price_cols = [c for c in prices.columns if prices[c].notna().sum() > 5]
         if not valid_price_cols:
             st.error("❌ All tickers returned insufficient data. Please check symbols or date range.")
@@ -572,12 +575,12 @@ if run_analysis:
         dropped = [c for c in prices.columns if c not in valid_price_cols]
         if dropped:
             st.warning(
-                f"⚠️ Dropped invalid/missing tickers due to insufficient data: {', '.join(dropped)}"
+                f"⚠️ Dropped invalid/missing tickers due to insufficient data: "
+                f"{', '.join(map(str, dropped))}"
             )
 
         prices = prices[valid_price_cols]
         daily_returns = daily_returns[valid_price_cols].dropna(how="all")
-
         effective_tickers = list(valid_price_cols)
 
         # Realign weights to surviving tickers
@@ -591,9 +594,9 @@ if run_analysis:
         else:
             w_vec = np.ones(len(effective_tickers), dtype=float) / float(len(effective_tickers))
 
-        # -----------------------------
-        # 4. Compute Sharpe metrics (using cleaned universe)
-        # -----------------------------
+        # ---------------------------------------------------------------------
+        # 4. Compute Sharpe metrics via shared analytics module
+        # ---------------------------------------------------------------------
         result = calculate_sharpe_ratio(
             tickers=effective_tickers,
             start_date=str(start_date),
@@ -611,7 +614,7 @@ if run_analysis:
         st.subheader("📋 Sharpe Ratio Results")
         st.dataframe(result, use_container_width=True)
 
-        # Prefer backend-reported metrics if backend weights were used and no tickers were dropped
+        # Prefer backend metrics if backend weights used and no assets were dropped
         if backend_used and backend_data and not dropped:
             sharpe_val = float(backend_data.get("sharpe", 0.0))
             ann_ret = float(backend_data.get("ann_return", 0.0))
@@ -619,14 +622,16 @@ if run_analysis:
         else:
             sharpe_series = result.get("sharpe_annualized", pd.Series([np.nan]))
             sharpe_val = float(sharpe_series.iloc[0])
+
             mean_ret = float(result.get("mean_daily_return", pd.Series([np.nan])).iloc[0])
             vol_daily = float(result.get("daily_volatility", pd.Series([np.nan])).iloc[0])
+
             ann_ret = mean_ret * 252.0 if not math.isnan(mean_ret) else float("nan")
             ann_vol = vol_daily * math.sqrt(252.0) if not math.isnan(vol_daily) else float("nan")
 
-        # -----------------------------
+        # ---------------------------------------------------------------------
         # 5. Summary Metrics
-        # -----------------------------
+        # ---------------------------------------------------------------------
         st.markdown("### 🧾 Key Performance Metrics")
         col1, col2, col3 = st.columns(3)
         col1.metric(
@@ -645,9 +650,9 @@ if run_analysis:
         if backend_used and backend_data.get("summary"):
             st.info(f"Backend optimizer: {backend_data['summary']}")
 
-        # -----------------------------
-        # 6. Portfolio Returns (using cleaned data & weights)
-        # -----------------------------
+        # ---------------------------------------------------------------------
+        # 6. Portfolio Returns (cleaned universe & final weights)
+        # ---------------------------------------------------------------------
         aligned = daily_returns.reindex(columns=effective_tickers).fillna(0.0)
         portfolio_returns = aligned.values @ w_vec
         portfolio_returns = pd.Series(portfolio_returns, index=aligned.index, name="Portfolio")
@@ -659,9 +664,9 @@ if run_analysis:
 
         cumulative = ensure_1d((1.0 + portfolio_returns).cumprod())
 
-        # -----------------------------
-        # 7. Benchmark
-        # -----------------------------
+        # ---------------------------------------------------------------------
+        # 7. Benchmark Handling
+        # ---------------------------------------------------------------------
         benchmark_sym = normalize_ticker(benchmark_input) if benchmark_input else ""
         if benchmark_sym == benchmark_input.upper() and benchmark_input:
             maybe = yahoo_search_symbol(benchmark_input)
@@ -692,9 +697,9 @@ if run_analysis:
                     f"⚠️ Could not download benchmark '{benchmark_sym}'. Plotting portfolio only."
                 )
 
-        # -----------------------------
-        # 8. Cumulative Chart
-        # -----------------------------
+        # ---------------------------------------------------------------------
+        # 8. Cumulative Growth Chart
+        # ---------------------------------------------------------------------
         st.subheader("📈 Cumulative Portfolio Growth vs Benchmark")
 
         if benchmark_cumulative is not None and not benchmark_cumulative.empty:
@@ -723,13 +728,17 @@ if run_analysis:
                 x="Date",
                 y="Portfolio",
                 title="Cumulative Growth: Portfolio",
-                labels={"Date": "Date", "Portfolio": "Growth (1 = Start)"},
+                labels={
+                    "Date": "Date",
+                    "Portfolio": "Growth (1 = Start)",
+                },
             )
+
         st.plotly_chart(fig_cum, use_container_width=True)
 
-        # -----------------------------
+        # ---------------------------------------------------------------------
         # 9. Return Distribution
-        # -----------------------------
+        # ---------------------------------------------------------------------
         st.subheader("📉 Daily Return Distribution")
         fig_hist = px.histogram(
             x=np.ravel(portfolio_returns.values),
@@ -740,10 +749,11 @@ if run_analysis:
         )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-        # -----------------------------
+        # ---------------------------------------------------------------------
         # 10. Rolling Sharpe Ratio
-        # -----------------------------
+        # ---------------------------------------------------------------------
         st.subheader("📊 Rolling Sharpe Ratio (60-day window)")
+
         window = 60
         rolling_mean = portfolio_returns.rolling(window).mean()
         rolling_std = portfolio_returns.rolling(window).std()
@@ -753,8 +763,11 @@ if run_analysis:
 
         if not rolling_sharpe.empty:
             rolling_df = rolling_sharpe.reset_index().rename(columns={"index": "Date"})
-            value_col = [c for c in rolling_df.columns if c != "Date"][0]
-            rolling_df = rolling_df.rename(columns={value_col: "Sharpe"})
+            value_col_candidates = [c for c in rolling_df.columns if c != "Date"]
+            if value_col_candidates:
+                value_col = value_col_candidates[0]
+                rolling_df = rolling_df.rename(columns={value_col: "Sharpe"})
+
             fig_roll = px.line(
                 rolling_df,
                 x="Date",
@@ -771,15 +784,15 @@ if run_analysis:
             st.plotly_chart(fig_roll, use_container_width=True)
         else:
             st.info("Not enough data to compute rolling Sharpe.")
-
     except Exception as e:
         st.error(f"❌ Unexpected error: {e}")
 else:
     st.info("👈 Configure your settings and click **Run Analysis** to begin.")
 
-# ===============================================================
+
+# =============================================================================
 # Compliance Disclaimer
-# ===============================================================
+# =============================================================================
 st.caption(
     "AlphaInsights is an educational analytics prototype and does not provide investment advice."
 )
