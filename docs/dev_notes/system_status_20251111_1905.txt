@@ -1,0 +1,8 @@
+AlphaInsights Backend Startup Snapshot — 2025-11-11 19:05:39.113906
+
+Backend Version: 1.7
+Supabase Enabled: True
+Supabase URL Configured: True
+Routers Registered: /logs/insights, /valuation
+Python Executable: C:\Users\info\PycharmProjects\AlphaInsights\.venv\Scripts\python.exe
+Working Directory: C:\Users\info\PycharmProjects\AlphaInsights

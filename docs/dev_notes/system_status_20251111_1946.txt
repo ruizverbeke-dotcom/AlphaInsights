@@ -1,0 +1,6 @@
+﻿AlphaInsights System Snapshot — 2025-11-11 19:46
+Backend Version: 1.7
+Active Branch: phase7.3-valuation-signals
+Supabase Enabled: true
+Routers Registered: /logs/insights, /valuation
+Last Commit: Phase 7.3: Valuation signals backend + Streamlit UI integration 

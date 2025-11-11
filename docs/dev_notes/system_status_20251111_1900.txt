@@ -1,0 +1,8 @@
+﻿AlphaInsights System Snapshot — 2025-11-11 19:00
+
+Backend Version: 1.6
+Active Branch: phase7.2-ui-fetch-refactor
+Supabase Enabled: true
+Routers Registered: /logs/insights, /valuation
+Last Commit: Phase 7.2: Added and integrated Valuation router ÔÇö backend endpoints + Streamlit dashboard connectivity verified 
+Environment: C:\Users\info\PycharmProjects\AlphaInsights\.venv/Scripts\python.exe
