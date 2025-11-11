@@ -110,18 +110,24 @@ if SUPABASE_ENABLED and test_connection is not None:
         SUPABASE_ENABLED = False
 
 # --------------------------------------------------------------------------- #
-# Optional modular routers (Phase 6.9+)
+# Optional modular routers (Phase 6.9+ and 7.1+)
 # --------------------------------------------------------------------------- #
 
 ROUTERS_AVAILABLE = False
-try:
-    # Example: advanced analytics/insights router (if present)
-    from backend.routes.log_insights import router as log_insights_router  # type: ignore
+log_insights_router = None
+valuation_router = None
 
+try:
+    from backend.routes.log_insights import router as log_insights_router  # type: ignore
     ROUTERS_AVAILABLE = True
 except Exception as e:  # noqa: BLE001
-    log_insights_router = None  # type: ignore[assignment]
     print(f"[Backend] ℹ️ log_insights router not loaded (ok for now): {e}")
+
+try:
+    from backend.routes.valuation import router as valuation_router  # type: ignore
+    ROUTERS_AVAILABLE = True
+except Exception as e:  # noqa: BLE001
+    print(f"[Backend] ℹ️ valuation router not loaded (ok for now): {e}")
 
 # --------------------------------------------------------------------------- #
 # FastAPI App
@@ -129,21 +135,25 @@ except Exception as e:  # noqa: BLE001
 
 app = FastAPI(
     title="AlphaInsights Backend API",
-    version="1.6",
+    version="1.7",
     description=(
-        "Backend for portfolio optimization, analytics, logging, and health.\n"
+        "Backend for portfolio optimization, valuation, analytics, logging, and health.\n"
         "- Shared symbol resolver + robust data pipeline.\n"
         "- Sharpe & CVaR optimizers.\n"
+        "- Valuation summary API for frontend dashboards.\n"
         "- Optional Supabase logging & query endpoints.\n"
-        "- /logs/insights for summarized usage analytics.\n"
-        "- Modular routers for future analytics."
+        "- Modular routers for advanced analytics and valuations."
     ),
 )
 
-if ROUTERS_AVAILABLE and log_insights_router is not None:
-    app.include_router(log_insights_router, prefix="/logs/insights")
-    print("[Backend] ✅ Registered /logs/insights router.")
-
+# Register routers dynamically if available
+if ROUTERS_AVAILABLE:
+    if log_insights_router is not None:
+        app.include_router(log_insights_router, prefix="/logs/insights")
+        print("[Backend] ✅ Registered /logs/insights router.")
+    if valuation_router is not None:
+        app.include_router(valuation_router, prefix="/valuation")
+        print("[Backend] ✅ Registered /valuation router.")
 
 # --------------------------------------------------------------------------- #
 # Pydantic Models (Agent & UI Friendly)
@@ -708,7 +718,6 @@ async def status_summary():
             "logs_insights": bool(compute_optimizer_insights is not None),
         },
     }
-
 
 # --------------------------------------------------------------------------- #
 # End of File
