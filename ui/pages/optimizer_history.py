@@ -44,7 +44,7 @@ def fetch_logs(
         params["end"] = end
 
     try:
-        r = requests.get(f"{BACKEND_URL}/logs/query", params=params, timeout=20)
+        r = fetch_backend(f"{BACKEND_URL}/logs/query", params=params, timeout=20)
         r.raise_for_status()
         data = r.json()
         if debug:

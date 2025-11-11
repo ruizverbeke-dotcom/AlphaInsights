@@ -151,7 +151,7 @@ def yahoo_search_symbol(query: str) -> str | None:
             return q.upper()
 
         url = "https://query1.finance.yahoo.com/v1/finance/search"
-        resp = requests.get(url, params={"q": q}, timeout=6)
+        resp = fetch_backend(url, params={"q": q}, timeout=6)
         if resp.status_code != 200:
             return None
 
@@ -299,7 +299,7 @@ def render_backend_health(backend_url: str) -> None:
     """
     url = backend_url.rstrip("/") + "/health"
     try:
-        resp = requests.get(url, timeout=3)
+        resp = fetch_backend(url, timeout=3)
         if resp.status_code == 200:
             st.sidebar.success("Backend: Online")
         else:

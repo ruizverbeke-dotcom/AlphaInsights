@@ -30,7 +30,7 @@ col1, col2 = st.columns(2)
 with col1:
     st.subheader("🔌 Backend Connection")
     try:
-        health = requests.get(f"{BACKEND_URL}/health", timeout=5).json()
+        health = fetch_backend(f"{BACKEND_URL}/health", timeout=5).json()
         st.success("Backend reachable ✅")
         st.json(health)
     except Exception as e:
@@ -39,7 +39,7 @@ with col1:
 with col2:
     st.subheader("🧩 System Summary")
     try:
-        summary = requests.get(f"{BACKEND_URL}/status/summary", timeout=5).json()
+        summary = fetch_backend(f"{BACKEND_URL}/status/summary", timeout=5).json()
         st.info("Status summary from backend:")
         st.json(summary)
     except Exception as e:

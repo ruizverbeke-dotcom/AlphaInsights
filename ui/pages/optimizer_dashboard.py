@@ -65,7 +65,7 @@ def _call_cvar_api(tickers: List[str], start_date: str, end_date: str, alpha: fl
 def _ping_backend_health() -> dict:
     """Query the backend /health endpoint to verify system status."""
     try:
-        resp = requests.get(f"{BACKEND_URL}/health", timeout=5)
+        resp = fetch_backend(f"{BACKEND_URL}/health", timeout=5)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
