@@ -17,13 +17,14 @@ Design:
 • Supports flexible symbol resolution ("gold" → "GC=F", etc.)
 • JSON-clean output (no NaNs)
 • Adds derived valuation & quality scoring (Phase 7.3)
-• Future-ready for Supabase / caching / analytics fusion
+• Phase 7.4: Supabase-backed caching for /valuation/signals
 """
 
 from __future__ import annotations
 
+from typing import List, Dict, Any, Optional
+
 from fastapi import APIRouter, Query, HTTPException
-from typing import List, Dict, Any
 import yfinance as yf
 import numpy as np
 import pandas as pd
@@ -33,6 +34,19 @@ try:
     from core.symbol_resolver import resolve_tickers
 except Exception:
     resolve_tickers = None
+
+# Supabase cache helpers (Phase 7.4)
+try:
+    from supabase_client.cache import (
+        get_cached_valuation,
+        put_cached_valuation,
+        is_cache_fresh,
+    )
+except Exception:
+    # If cache module or Supabase are not available, caching is simply disabled.
+    get_cached_valuation = None  # type: ignore
+    put_cached_valuation = None  # type: ignore
+    is_cache_fresh = None  # type: ignore
 
 # --------------------------------------------------------------------------- #
 # Router Init
@@ -63,25 +77,25 @@ VALUATION_FIELDS = [
 ]
 
 # --------------------------------------------------------------------------- #
-# Health Endpoint
+# Helpers
 # --------------------------------------------------------------------------- #
 
-@router.get("/health")
-async def valuation_health() -> Dict[str, Any]:
-    """
-    Lightweight health/status check for the valuation module.
-    """
-    return {
-        "status": "ok",
-        "module": "valuation",
-        "message": "Valuation router active and ready.",
-        "source": "yfinance",
-        "version": "1.2",
-    }
 
-# --------------------------------------------------------------------------- #
-# Core Fetch Logic
-# --------------------------------------------------------------------------- #
+def _build_cache_key_from_tickers(tickers_list: List[str]) -> str:
+    """
+    Build a deterministic cache key from the given tickers.
+
+    Phase 7.4 scope:
+    - Only tickers are included.
+    - Symbols are uppercased and sorted.
+    - Future extensions (benchmark, region, versioning) can be added here
+      when they actually affect backend behavior.
+    """
+    normalized = [t.strip().upper() for t in tickers_list if t.strip()]
+    unique_sorted = sorted(set(normalized))
+    tickers_str = ",".join(unique_sorted)
+    return f"valuation:v1:tickers={tickers_str}"
+
 
 def safe_fetch(ticker: str) -> Dict[str, Any]:
     """
@@ -114,13 +128,37 @@ def safe_fetch(ticker: str) -> Dict[str, Any]:
 
     return row
 
+
+# --------------------------------------------------------------------------- #
+# Health Endpoint
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/health")
+async def valuation_health() -> Dict[str, Any]:
+    """
+    Lightweight health/status check for the valuation module.
+    """
+    return {
+        "status": "ok",
+        "module": "valuation",
+        "message": "Valuation router active and ready.",
+        "source": "yfinance",
+        "version": "1.2",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # /valuation/summary
 # --------------------------------------------------------------------------- #
 
+
 @router.get("/summary")
 async def valuation_summary(
-    tickers: str = Query(..., description="Comma-separated ticker list (e.g., AAPL,MSFT,NVDA,SPY)")
+    tickers: str = Query(
+        ...,
+        description="Comma-separated ticker list (e.g., AAPL,MSFT,NVDA,SPY)",
+    )
 ) -> Dict[str, Any]:
     """
     Return a unified valuation summary for the requested tickers.
@@ -169,13 +207,18 @@ async def valuation_summary(
     }
     return payload
 
+
 # --------------------------------------------------------------------------- #
-# /valuation/signals — Phase 7.3
+# /valuation/signals — Phase 7.3 + Phase 7.4 caching
 # --------------------------------------------------------------------------- #
+
 
 @router.get("/signals")
 async def valuation_signals(
-    tickers: str = Query(..., description="Comma-separated ticker list for signal computation")
+    tickers: str = Query(
+        ...,
+        description="Comma-separated ticker list for signal computation",
+    )
 ) -> Dict[str, Any]:
     """
     Return peer-relative valuation, quality, and payout scores (0–100 normalized).
@@ -186,12 +229,44 @@ async def valuation_signals(
     - quality_score    → profitability strength (ROE, margins)
     - payout_score     → dividend yield vs peers
     - risk_flags       → heuristic attention markers
+
+    Phase 7.4:
+    ----------
+    - Supabase-backed caching layer around the full response payload.
+    - Cache is best-effort and never allowed to break endpoint behavior.
     """
     tickers_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     if not tickers_list:
         raise HTTPException(status_code=400, detail="No tickers provided.")
 
-    # Re-use safe_fetch
+    # --------------------------------------------------------------------- #
+    # 1) Try cache (if cache helpers are available)
+    # --------------------------------------------------------------------- #
+    cache_payload: Optional[Dict[str, Any]] = None
+    cache_key: Optional[str] = None
+
+    if get_cached_valuation is not None and is_cache_fresh is not None:
+        try:
+            cache_key = _build_cache_key_from_tickers(tickers_list)
+            cache_row = get_cached_valuation(cache_key)
+            if cache_row and is_cache_fresh(cache_row):
+                maybe_payload = cache_row.get("payload")
+                if isinstance(maybe_payload, dict):
+                    cache_payload = maybe_payload
+        except Exception as e:
+            # Any cache issue is logged and ignored.
+            print(f"[valuation] Cache lookup failed: {e}")
+            cache_payload = None
+
+    if cache_payload is not None:
+        # Ensure meta exists and set cache_hit flag.
+        meta = cache_payload.setdefault("meta", {})
+        meta["cache_hit"] = True
+        return cache_payload
+
+    # --------------------------------------------------------------------- #
+    # 2) Cache miss or cache disabled → compute live (Phase 7.3 logic)
+    # --------------------------------------------------------------------- #
     results = [safe_fetch(t) for t in tickers_list]
     df = pd.DataFrame(results)
 
@@ -200,8 +275,12 @@ async def valuation_signals(
 
     # Convert numeric fields
     numeric_cols = [
-        "trailingPE", "priceToBook", "enterpriseToEbitda",
-        "profitMargins", "returnOnEquity", "dividendYieldPct",
+        "trailingPE",
+        "priceToBook",
+        "enterpriseToEbitda",
+        "profitMargins",
+        "returnOnEquity",
+        "dividendYieldPct",
     ]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df.get(col), errors="coerce")
@@ -211,13 +290,13 @@ async def valuation_signals(
         return 1.0 / df[col].replace(0, np.nan)
 
     cheap_signal = (
-        0.5 * inv("trailingPE") +
-        0.3 * inv("priceToBook") +
-        0.2 * inv("enterpriseToEbitda")
+        0.5 * inv("trailingPE")
+        + 0.3 * inv("priceToBook")
+        + 0.2 * inv("enterpriseToEbitda")
     )
     qual_signal = (
-        0.6 * df["returnOnEquity"].fillna(0) +
-        0.4 * df["profitMargins"].fillna(0)
+        0.6 * df["returnOnEquity"].fillna(0)
+        + 0.4 * df["profitMargins"].fillna(0)
     )
     payout_signal = df["dividendYieldPct"].fillna(0)
 
@@ -249,14 +328,26 @@ async def valuation_signals(
 
     df = df.fillna(np.nan).replace({np.nan: None})
 
-    return {
+    response_payload: Dict[str, Any] = {
         "signals": df.to_dict(orient="records"),
         "meta": {
             "count": len(df),
             "computed_at": pd.Timestamp.utcnow().isoformat(),
             "note": "Peer-relative valuation and quality signals (Phase 7.3).",
+            "cache_hit": False,
         },
     }
+
+    # --------------------------------------------------------------------- #
+    # 3) Store in cache (best-effort, never fatal)
+    # --------------------------------------------------------------------- #
+    if put_cached_valuation is not None and cache_key is not None:
+        try:
+            put_cached_valuation(cache_key, response_payload)
+        except Exception as e:
+            print(f"[valuation] Error while caching payload for key {cache_key}: {e}")
+
+    return response_payload
 
 # --------------------------------------------------------------------------- #
 # End of File
